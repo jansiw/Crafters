@@ -941,7 +941,7 @@ int main()
             for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
                 glm::ivec2 chunkPos(x, z);
                 if (g_WorldChunks.find(chunkPos) == g_WorldChunks.end()) {
-                    chunk_storage.emplace_back(glm::vec3(x * CHUNK_WIDTH, 0.0f, z * CHUNK_DEPTH), G_WORLD_NAME, G_WORLD_SEED);
+                    chunk_storage.emplace_back(glm::vec3(x * CHUNK_WIDTH, 0.0f, z * CHUNK_DEPTH), g_selectedWorldName, g_selectedWorldSeed);
                     Chunk* newChunk = &chunk_storage.back();
                     g_WorldChunks[chunkPos] = newChunk;
                     chunksToBuild.push_back(newChunk);
