@@ -21,7 +21,16 @@
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
-
+#include <cstdlib> // Dla rand() i srand()
+#include <ctime>   // Dla time()
+enum GameState {
+    STATE_MAIN_MENU,
+    STATE_NEW_WORLD_MENU,
+    STATE_LOADING_WORLD,
+    STATE_IN_GAME,
+    STATE_EXITING
+};
+GameState g_currentState = STATE_MAIN_MENU;
 
 // Prototypy funkcji
 void framebuffer_size_callback(GLFWwindow* window, int width, int height);
@@ -30,12 +39,53 @@ void mouse_callback(GLFWwindow* window, double xpos, double ypos);
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods); // <<< NOWOŚĆ
 bool Raycast(glm::vec3 startPos, glm::vec3 direction, float maxDist, glm::ivec3& out_hitBlock, glm::ivec3& out_prevBlock);
 void scroll_callback(GLFWwindow* window, double xoffset, double yoffset); // <<< NOWOŚĆ
-
+bool IsMouseOver(double mouseX, double mouseY, float x, float y, float w, float h);
+void DrawMenuButton(Shader& uiShader, unsigned int vao, unsigned int textureID, float x, float y, float w, float h);
+void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods);
+void char_callback(GLFWwindow* window, unsigned int codepoint);
+void RenderText(Shader& shader, unsigned int vao, const std::string& text,
+                float x, float y, float size);
 // Ustawienia
 const unsigned int SCR_WIDTH = 1280; // Zwiększmy trochę rozdzielczość
 const unsigned int SCR_HEIGHT = 720;
+std::string g_selectedWorldName;
+int g_selectedWorldSeed;
+std::vector<std::string> existingWorlds;
+int currentMenuPage = 0;
 
+// Tekstury przycisków
+unsigned int texBtnNew, texBtnLoad, texBtnQuit;
 
+// Stałe przycisków (muszą być globalne dla callbacka myszy)
+const float BTN_W = 300.0f;
+const float BTN_H = 60.0f;
+const float BTN_X = (SCR_WIDTH - BTN_W) / 2.0f;
+const float BTN_Y_NEW = SCR_HEIGHT / 2.0f + 70.0f;
+const float BTN_Y_LOAD = SCR_HEIGHT / 2.0f;
+const float BTN_Y_QUIT = SCR_HEIGHT / 2.0f - 70.0f;
+std::string g_inputWorldName = "NowySwiat";
+std::string g_inputSeedString;
+int g_activeInput = 0; // 0 = Nazwa, 1 = Seed, -1 = Brak
+
+// Tekstury dla nowego menu
+unsigned int texBtnStart;
+unsigned int texBtnBack;
+unsigned int texInputBox; // Będziemy reużywać ui_slot.png
+unsigned int texFont;
+
+// Pozycje dla nowego menu (ustaw je jak chcesz)
+const float INPUT_W = 400.0f;
+const float INPUT_H = 50.0f;
+const float INPUT_X = (SCR_WIDTH - INPUT_W) / 2.0f;
+const float INPUT_NAME_Y = SCR_HEIGHT / 2.0f + 60.0f;
+const float INPUT_SEED_Y = SCR_HEIGHT / 2.0f;
+
+const float BTN_START_X = (SCR_WIDTH - BTN_W) / 2.0f;
+const float BTN_START_Y = SCR_HEIGHT / 2.0f - 70.0f;
+const float BTN_BACK_X = (SCR_WIDTH - BTN_W) / 2.0f;
+const float BTN_BACK_Y = SCR_HEIGHT / 2.0f - 140.0f;
+const float FONT_ATLAS_COLS = 16.0f;
+const float FONT_ATLAS_ROWS = 8.0f;
 // Kamera (ustawiona wyżej, żeby widzieć świat)
 Camera camera(glm::vec3(8.0f, 40.0f, 8.0f));
 float lastX = SCR_WIDTH / 2.0f;
@@ -309,6 +359,8 @@ int main()
     glfwSetCursorPosCallback(window, mouse_callback);
     glfwSetMouseButtonCallback(window, mouse_button_callback);
     glfwSetScrollCallback(window, scroll_callback);
+    glfwSetCharCallback(window, char_callback);
+    glfwSetKeyCallback(window, key_callback);
 
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
     {
@@ -480,148 +532,265 @@ int main()
     glEnableVertexAttribArray(0);
     glBindVertexArray(0);
     // ... (kod odglBindVertexArray(0); dla Skyboxa)
+    // Inicjalizacja generatora liczb losowych
+    srand(static_cast<unsigned int>(time(NULL)));
 
+    // Wczytaj tekstury przycisków
+    texBtnNew = loadUITexture("button_new_world.png");
+    texBtnLoad = loadUITexture("button_load_world.png");
+    texBtnQuit = loadUITexture("button_quit.png");
+    texBtnStart = loadUITexture("button_start.png");
+    texBtnBack = loadUITexture("button_back.png");
+    texInputBox = loadUITexture("ui_slot.png"); // Reużywamy starej tekstury
+    texFont = loadUITexture("font.png");
     // --- NOWOŚĆ: PĘTLA ŁADOWANIA I WYGASZANIA ---
     glm::mat4 ortho_projection = glm::ortho(0.0f, (float)SCR_WIDTH, 0.0f, (float)SCR_HEIGHT);
-    std::cout << "Ladowanie poczatkowego obszaru..." << std::endl;
+
+
+   while (g_currentState != STATE_EXITING)
+{
+    // Obliczanie deltaTime (wspólne dla wszystkich stanów)
+    // auto currentFrame = static_cast<float>(glfwGetTime());
+    // deltaTime = currentFrame - lastFrame;
+    // lastFrame = currentFrame;
+
+    switch (g_currentState)
     {
-        // === ETAP 1: Pokaż statyczny obrazek ładowania ===
-        glDisable(GL_DEPTH_TEST);
-        uiShader.use();
-        uiShader.setMat4("projection", ortho_projection);
-        uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
-        uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
-        uiShader.setFloat("u_opacity", 1.0f); // W pełni widoczny
+        case STATE_MAIN_MENU:
+        {
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL); // POKAŻ KURSOR
 
-        glm::mat4 model = glm::mat4(1.0f);
-        model = glm::scale(model, glm::vec3(SCR_WIDTH, SCR_HEIGHT, 1.0f));
-        uiShader.setMat4("model", model);
+            glClearColor(0.1f, 0.1f, 0.1f, 1.0f); // Ciemne tło
+            glClear(GL_COLOR_BUFFER_BIT);
 
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // Czarne tło
-        glClear(GL_COLOR_BUFFER_BIT);
+            uiShader.use();
+            uiShader.setMat4("projection", ortho_projection);
+            uiShader.setFloat("u_opacity", 1.0f);
+            uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+            uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+            uiShader.setInt("uiTexture", 0);
 
-        glBindVertexArray(hotbarVAO); // Użyj "pędzla" (unit quad)
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, loadingTextureID);
-        uiShader.setInt("uiTexture", 0);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
+            if (currentMenuPage == 0) {
+                DrawMenuButton(uiShader, hotbarVAO, texBtnNew, BTN_X, BTN_Y_NEW, BTN_W, BTN_H);
+                DrawMenuButton(uiShader, hotbarVAO, texBtnLoad, BTN_X, BTN_Y_LOAD, BTN_W, BTN_H);
+                DrawMenuButton(uiShader, hotbarVAO, texBtnQuit, BTN_X, BTN_Y_QUIT, BTN_W, BTN_H);
+            }
+            // else if (currentMenuPage == 1) { /* Kod dla listy światów */ }
 
-        glfwSwapBuffers(window);
-        glfwPollEvents();
+            break; // Koniec case STATE_MAIN_MENU
+        }
+        case STATE_NEW_WORLD_MENU:
+        {
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
 
-        // === ETAP 2: Wykonaj całą ciężką pracę (generowanie świata) ===
-        // (Ten kod jest ukryty za ekranem ładowania)
-        int playerChunkX = static_cast<int>(floor(camera.Position.x / CHUNK_WIDTH));
-        int playerChunkZ = static_cast<int>(floor(camera.Position.z / CHUNK_DEPTH));
-        std::vector<Chunk*> chunksToBuild;
-        for (int x = playerChunkX - RENDER_DISTANCE; x <= playerChunkX + RENDER_DISTANCE; x++) {
-            for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
-                glm::ivec2 chunkPos(x, z);
-                if (g_WorldChunks.find(chunkPos) == g_WorldChunks.end()) {
-                    chunk_storage.emplace_back(glm::vec3(x * CHUNK_WIDTH, 0.0f, z * CHUNK_DEPTH), G_WORLD_NAME, G_WORLD_SEED);
-                    Chunk* newChunk = &chunk_storage.back();
-                    g_WorldChunks[chunkPos] = newChunk;
-                    chunksToBuild.push_back(newChunk);
+            glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+
+            uiShader.use();
+            uiShader.setMat4("projection", ortho_projection);
+            uiShader.setFloat("u_opacity", 1.0f);
+            uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+            uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+            uiShader.setInt("uiTexture", 0);
+
+            // TODO: Narysuj etykiety "Nazwa Świata:", "Seed:" (gdy będziesz miał fonty)
+
+            // Rysuj pole nazwy
+            DrawMenuButton(uiShader, hotbarVAO, texInputBox, INPUT_X, INPUT_NAME_Y, INPUT_W, INPUT_H);
+
+            // Rysuj pole seeda
+            DrawMenuButton(uiShader, hotbarVAO, texInputBox, INPUT_X, INPUT_SEED_Y, INPUT_W, INPUT_H);
+
+            // --- NOWY KOD DO RYSOWANIA TEKSTU ---
+
+            // Przygotuj stringi z migającym kursorem
+            std::string name_to_render = g_inputWorldName;
+            std::string seed_to_render = g_inputSeedString;
+
+            // Sprawdzamy czas, aby kursor migał co pół sekundy
+            if (static_cast<int>(glfwGetTime() * 2.0f) % 2 == 0) {
+                if (g_activeInput == 0) name_to_render += "_";
+                else if (g_activeInput == 1) seed_to_render += "_";
+            }
+
+            // Definiujemy rozmiar i padding tekstu
+            float FONT_SIZE = 24.0f;
+            float PADDING_X = 10.0f;
+            float PADDING_Y = (INPUT_H - FONT_SIZE) / 2.0f; // Wyśrodkuj w pionie
+
+            // Rysuj tekst
+            RenderText(uiShader, hotbarVAO, name_to_render, INPUT_X + PADDING_X, INPUT_NAME_Y + PADDING_Y, FONT_SIZE);
+            RenderText(uiShader, hotbarVAO, seed_to_render, INPUT_X + PADDING_X, INPUT_SEED_Y + PADDING_Y, FONT_SIZE);
+
+
+            // Rysuj przycisk Start
+            DrawMenuButton(uiShader, hotbarVAO, texBtnStart, BTN_START_X, BTN_START_Y, BTN_W, BTN_H);
+            // Rysuj przycisk Wstecz
+            DrawMenuButton(uiShader, hotbarVAO, texBtnBack, BTN_BACK_X, BTN_BACK_Y, BTN_W, BTN_H);
+            break;
+        }
+        case STATE_LOADING_WORLD: {
+        {
+            // === ETAP 1: Pokaż statyczny obrazek ładowania ===
+            glDisable(GL_DEPTH_TEST);
+            uiShader.use();
+            uiShader.setMat4("projection", ortho_projection);
+            uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+            uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+            uiShader.setFloat("u_opacity", 1.0f); // W pełni widoczny
+
+            glm::mat4 model = glm::mat4(1.0f);
+            model = glm::scale(model, glm::vec3(SCR_WIDTH, SCR_HEIGHT, 1.0f));
+            uiShader.setMat4("model", model);
+
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // Czarne tło
+            glClear(GL_COLOR_BUFFER_BIT);
+
+            glBindVertexArray(hotbarVAO); // Użyj "pędzla" (unit quad)
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, loadingTextureID);
+            uiShader.setInt("uiTexture", 0);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+
+            glfwSwapBuffers(window);
+            glfwPollEvents();
+
+            // === ETAP 2: Wykonaj całą ciężką pracę (generowanie świata) ===
+            // (Ten kod jest ukryty za ekranem ładowania)
+            int playerChunkX = static_cast<int>(floor(camera.Position.x / CHUNK_WIDTH));
+            int playerChunkZ = static_cast<int>(floor(camera.Position.z / CHUNK_DEPTH));
+            std::vector<Chunk*> chunksToBuild;
+            for (int x = playerChunkX - RENDER_DISTANCE; x <= playerChunkX + RENDER_DISTANCE; x++) {
+                for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
+                    glm::ivec2 chunkPos(x, z);
+                    if (g_WorldChunks.find(chunkPos) == g_WorldChunks.end()) {
+                        chunk_storage.emplace_back(glm::vec3(x * CHUNK_WIDTH, 0.0f, z * CHUNK_DEPTH), g_selectedWorldName, g_selectedWorldSeed);
+                        Chunk* newChunk = &chunk_storage.back();
+                        g_WorldChunks[chunkPos] = newChunk;
+                        chunksToBuild.push_back(newChunk);
+                    }
                 }
             }
+            for (Chunk* chunk : chunksToBuild) {
+                chunk->buildMesh();
+            }
         }
-        for (Chunk* chunk : chunksToBuild) {
-            chunk->buildMesh();
-        }
-    }
-    std::cout << "Ladowanie zakonczone. Wygaszanie..." << std::endl;
+        std::cout << "Ladowanie zakonczone. Wygaszanie..." << std::endl;
 
-    // === ETAP 3: Pętla Wygaszania (Fade-out) ===
-    float fadeDuration = 1.0f; // Czas trwania wygaszania (w sekundach)
-    float fadeTimer = fadeDuration;
+        // === ETAP 3: Pętla Wygaszania (Fade-out) ===
+        float fadeDuration = 1.0f; // Czas trwania wygaszania (w sekundach)
+        float fadeTimer = fadeDuration;
 
-    // Pobierz czas rozpoczęcia wygaszania
-    float fadeStartTime = static_cast<float>(glfwGetTime());
-    float lastFadeFrame = fadeStartTime;
+        // Pobierz czas rozpoczęcia wygaszania
+        float fadeStartTime = static_cast<float>(glfwGetTime());
+        float lastFadeFrame = fadeStartTime;
 
-    while (fadeTimer > 0.0f)
-    {
-        // Oblicz deltaTime dla tej mini-pętli
-        float currentFadeFrame = static_cast<float>(glfwGetTime());
-        float fadeDeltaTime = currentFadeFrame - lastFadeFrame;
-        lastFadeFrame = currentFadeFrame;
+        while (fadeTimer > 0.0f)
+        {
+            // Oblicz deltaTime dla tej mini-pętli
+            float currentFadeFrame = static_cast<float>(glfwGetTime());
+            float fadeDeltaTime = currentFadeFrame - lastFadeFrame;
+            lastFadeFrame = currentFadeFrame;
 
-        fadeTimer -= fadeDeltaTime;
-        float opacity = fadeTimer / fadeDuration; // Opacity od 1.0 do 0.0
+            fadeTimer -= fadeDeltaTime;
+            float opacity = fadeTimer / fadeDuration; // Opacity od 1.0 do 0.0
 
-        // --- Rysuj świat (tylko Solid + Skybox) ---
-        // (Musimy narysować to, co jest "pod" ekranem ładowania)
-        glClearColor(SKY_COLOR.x, SKY_COLOR.y, SKY_COLOR.z, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            // --- Rysuj świat (tylko Solid + Skybox) ---
+            // (Musimy narysować to, co jest "pod" ekranem ładowania)
+            glClearColor(SKY_COLOR.x, SKY_COLOR.y, SKY_COLOR.z, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        // Oblicz macierze (tak jak w głównej pętli)
-        float viewDistance = (RENDER_DISTANCE + 1) * CHUNK_WIDTH;
-        glm::mat4 projection = glm::perspective(glm::radians(camera.Zoom), (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, viewDistance);
-        glm::mat4 view = camera.GetViewMatrix();
+            // Oblicz macierze (tak jak w głównej pętli)
+            float viewDistance = (RENDER_DISTANCE + 1) * CHUNK_WIDTH;
+            glm::mat4 projection = glm::perspective(glm::radians(camera.Zoom), (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, viewDistance);
+            glm::mat4 view = camera.GetViewMatrix();
 
-        // Rysuj Skybox (bez zmian)
-        if (cubemapTexture != 0) {
-            glDepthFunc(GL_LEQUAL);
-            skyboxShader.use();
-            skyboxShader.setMat4("projection", projection);
-            skyboxShader.setMat4("view", glm::mat4(glm::mat3(view)));
-            glBindVertexArray(skyboxVAO);
+            // Rysuj Skybox (bez zmian)
+            if (cubemapTexture != 0) {
+                glDepthFunc(GL_LEQUAL);
+                skyboxShader.use();
+                skyboxShader.setMat4("projection", projection);
+                skyboxShader.setMat4("view", glm::mat4(glm::mat3(view)));
+                glBindVertexArray(skyboxVAO);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_CUBE_MAP, cubemapTexture);
+                glDrawArrays(GL_TRIANGLES, 0, 36);
+                glBindVertexArray(0);
+                glDepthFunc(GL_LESS);
+            }
+
+            // Rysuj Solid Pass (Ląd)
+            ourShader.use();
+            ourShader.setMat4("projection", projection);
+            ourShader.setMat4("view", view);
+            // (Ustawienia mgły dla ourShader)
+            float fogStart = (RENDER_DISTANCE - 2) * CHUNK_WIDTH;
+            float fogEnd = (RENDER_DISTANCE + 1) * CHUNK_WIDTH;
+            ourShader.setVec3("u_fogColor", SKY_COLOR);
+            ourShader.setFloat("u_fogStart", fogStart);
+            ourShader.setFloat("u_fogEnd", fogEnd);
+
+            glDepthMask(GL_TRUE);
+            glEnable(GL_CULL_FACE);
+            for (auto const& [pos, chunk] : g_WorldChunks) {
+                chunk->DrawSolid(ourShader, textureAtlas);
+            }
+
+            // --- Rysuj Ekran Ładowania (NA WIERZCHU) ---
+            glDisable(GL_DEPTH_TEST);
+            uiShader.use();
+            uiShader.setMat4("projection", ortho_projection); // Użyj ortho z Etapu 1
+            uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+            uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+            uiShader.setFloat("u_opacity", opacity); // Użyj obliczonej przezroczystości
+
+            auto model = glm::mat4(1.0f);
+            model = glm::scale(model, glm::vec3(SCR_WIDTH, SCR_HEIGHT, 1.0f));
+            uiShader.setMat4("model", model);
+
+            glBindVertexArray(hotbarVAO);
             glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_CUBE_MAP, cubemapTexture);
-            glDrawArrays(GL_TRIANGLES, 0, 36);
-            glBindVertexArray(0);
-            glDepthFunc(GL_LESS);
+            glBindTexture(GL_TEXTURE_2D, loadingTextureID);
+            uiShader.setInt("uiTexture", 0);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+
+            glEnable(GL_DEPTH_TEST);
+
+            glfwSwapBuffers(window);
+            glfwPollEvents();
         }
-
-        // Rysuj Solid Pass (Ląd)
-        ourShader.use();
-        ourShader.setMat4("projection", projection);
-        ourShader.setMat4("view", view);
-        // (Ustawienia mgły dla ourShader)
-        float fogStart = (RENDER_DISTANCE - 2) * CHUNK_WIDTH;
-        float fogEnd = (RENDER_DISTANCE + 1) * CHUNK_WIDTH;
-        ourShader.setVec3("u_fogColor", SKY_COLOR);
-        ourShader.setFloat("u_fogStart", fogStart);
-        ourShader.setFloat("u_fogEnd", fogEnd);
-
-        glDepthMask(GL_TRUE);
-        glEnable(GL_CULL_FACE);
-        for (auto const& [pos, chunk] : g_WorldChunks) {
-            chunk->DrawSolid(ourShader, textureAtlas);
-        }
-
-        // --- Rysuj Ekran Ładowania (NA WIERZCHU) ---
-        glDisable(GL_DEPTH_TEST);
-        uiShader.use();
-        uiShader.setMat4("projection", ortho_projection); // Użyj ortho z Etapu 1
-        uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
-        uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
-        uiShader.setFloat("u_opacity", opacity); // Użyj obliczonej przezroczystości
-
-        glm::mat4 model = glm::mat4(1.0f);
-        model = glm::scale(model, glm::vec3(SCR_WIDTH, SCR_HEIGHT, 1.0f));
-        uiShader.setMat4("model", model);
-
-        glBindVertexArray(hotbarVAO);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, loadingTextureID);
-        uiShader.setInt("uiTexture", 0);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-
-        glEnable(GL_DEPTH_TEST);
-
-        glfwSwapBuffers(window);
-        glfwPollEvents();
-    }
     // --- KONIEC PĘTLI ŁADOWANIA I WYGASZANIA ---
 
     // Ustaw czas startowy dla głównej pętli gry
     lastFrame = static_cast<float>(glfwGetTime());
 
-   while (!glfwWindowShouldClose(window))
-    {
-        // --- 1. OBLICZENIA CZASU I INPUTU ---
-        auto currentFrame = static_cast<float>(glfwGetTime());
+            // 1. ZNAJDŹ I ZAMIEŃ (w kodzie który właśnie wkleiłeś):
+            //    G_WORLD_NAME -> g_selectedWorldName
+            //    G_WORLD_SEED -> g_selectedWorldSeed
+
+            // 2. DODAJ NA KOŃCU TEGO BLOKU (po pętli 'while(fadeTimer > 0.0f)'):
+            //    Kod do zapisywania seeda
+            std::string infoPath = "worlds/" + g_selectedWorldName + "/world.info";
+            if (!std::filesystem::exists(infoPath)) {
+                std::ofstream infoFile(infoPath);
+                if (infoFile.is_open()) {
+                    infoFile << g_selectedWorldSeed; // Zapisz seed
+                    infoFile.close();
+                }
+            }
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED); // UKRYJ KURSOR
+            g_currentState = STATE_IN_GAME; // Przełącz stan!
+
+            break; // Koniec case STATE_LOADING_WORLD
+        }
+
+        case STATE_IN_GAME:
+        {
+            auto currentFrame = static_cast<float>(glfwGetTime());
         deltaTime = currentFrame - lastFrame;
         lastFrame = currentFrame;
 
@@ -985,9 +1154,21 @@ int main()
         glEnable(GL_CULL_FACE);
         glDepthMask(GL_TRUE);
         // --- 5. SWAP BUFFERS ---
-        glfwSwapBuffers(window);
-        glfwPollEvents();
+        // glfwSwapBuffers(window);
+        // glfwPollEvents();
+
+            break; // Koniec case STATE_IN_GAME
+        }
+
+        case STATE_EXITING:
+            // Pętla się zakończy
+            break;
     }
+
+    // Wspólne dla wszystkich stanów
+    glfwSwapBuffers(window);
+    glfwPollEvents();
+}
 
     // --- 6. Sprzątanie ---
     // Destruktory chunków (`~Chunk()`) zostaną wywołane automatycznie
@@ -1022,9 +1203,14 @@ void processInput(GLFWwindow *window)
     }
 
     // Zamknięcie okna
-    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
-        glfwSetWindowShouldClose(window, true);
-
+    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+        if (g_currentState == STATE_IN_GAME) {
+            g_currentState = STATE_MAIN_MENU; // Wróć do menu
+            // Musimy zresetować stan, aby nie iść w kierunku po powrocie do gry
+            wishDir = glm::vec3(0.0f);
+            wishJump = false;
+        }
+    }
     // Przełącznik trybu Latanie/Chodzenie
     if (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS) {
         if (!f_pressed) {
@@ -1131,22 +1317,126 @@ bool Raycast(glm::vec3 startPos, glm::vec3 direction, float maxDist, glm::ivec3&
 
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 {
-    // POPRAWKA: Musimy użyć nowej pozycji oczu
-    glm::vec3 eyePos = camera.Position + glm::vec3(0.0f, PLAYER_EYE_HEIGHT, 0.0f);
+    // === OBSŁUGA STANU MENU ===
+    if (g_currentState == STATE_MAIN_MENU && button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS)
+    {
+        double mouseX, mouseY;
+        glfwGetCursorPos(window, &mouseX, &mouseY);
 
-    // Zmienne lokalne zamiast globalnych
+        if (currentMenuPage == 0) // Główne menu
+        {
+            if (IsMouseOver(mouseX, mouseY, BTN_X, BTN_Y_NEW, BTN_W, BTN_H))
+            {
+                // --- NOWY ŚWIAT ---
+                // TODO: W przyszłości zrób tu pole do wpisania nazwy
+                g_inputWorldName = "NowySwiat"; // Ustaw domyślne
+                g_inputSeedString = "";
+                g_activeInput = 0; // Aktywuj pierwsze pole
+                g_currentState = STATE_NEW_WORLD_MENU; // Przejdź do nowego menu
+            }
+            else if (IsMouseOver(mouseX, mouseY, BTN_X, BTN_Y_LOAD, BTN_W, BTN_H))
+            {
+                // --- ZAŁADUJ ŚWIAT ---
+                std::cout << "Wybieranie swiata do wczytania..." << std::endl;
+
+                existingWorlds.clear();
+                std::string worldsPath = "worlds";
+                if (std::filesystem::exists(worldsPath)) {
+                    for (const auto& entry : std::filesystem::directory_iterator(worldsPath)) {
+                        if (entry.is_directory()) {
+                            existingWorlds.push_back(entry.path().filename().string());
+                        }
+                    }
+                }
+
+                // TODO: Zamiast ładować pierwszy, przełącz na 'currentMenuPage = 1'
+                // i narysuj listę 'existingWorlds'.
+                // Na razie na sztywno ładujemy pierwszy z listy lub stary świat.
+
+                std::string worldToLoad = "MojPierwszySwiat"; // Domyślny
+                if (!existingWorlds.empty()) {
+                     worldToLoad = existingWorlds[0];
+                }
+
+                g_selectedWorldName = worldToLoad;
+                g_selectedWorldSeed = 12345; // Domyślny seed
+
+                std::string infoPath = "worlds/" + g_selectedWorldName + "/world.info";
+                if (std::filesystem::exists(infoPath)) {
+                    std::ifstream infoFile(infoPath);
+                    if (infoFile.is_open()) {
+                        infoFile >> g_selectedWorldSeed; // Wczytaj prawdziwy seed
+                        infoFile.close();
+                    }
+                }
+                std::cout << "Ladowanie swiata: " << g_selectedWorldName << " (Seed: " << g_selectedWorldSeed << ")" << std::endl;
+                g_currentState = STATE_LOADING_WORLD;
+            }
+            else if (IsMouseOver(mouseX, mouseY, BTN_X, BTN_Y_QUIT, BTN_W, BTN_H))
+            {
+                g_currentState = STATE_EXITING;
+            }
+        }
+
+        // else if (currentMenuPage == 1) { /* ... obsługa kliknięć na listę światów ... */ }
+        return; // Ważne: nie wykonuj kodu gry
+    }
+    else if (g_currentState == STATE_NEW_WORLD_MENU && button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS)
+    {
+        double mouseX, mouseY;
+        glfwGetCursorPos(window, &mouseX, &mouseY);
+
+        // Kliknięcie na pole Nazwy
+        if (IsMouseOver(mouseX, mouseY, INPUT_X, INPUT_NAME_Y, INPUT_W, INPUT_H)) {
+            g_activeInput = 0;
+        }
+        // Kliknięcie na pole Seeda
+        else if (IsMouseOver(mouseX, mouseY, INPUT_X, INPUT_SEED_Y, INPUT_W, INPUT_H)) {
+            g_activeInput = 1;
+        }
+        // Kliknięcie "Start"
+        else if (IsMouseOver(mouseX, mouseY, BTN_START_X, BTN_START_Y, BTN_W, BTN_H))
+        {
+            g_selectedWorldName = g_inputWorldName;
+            if (g_selectedWorldName.empty()) g_selectedWorldName = "SwiatBezNazwy";
+
+            if (g_inputSeedString.empty()) {
+                g_selectedWorldSeed = rand(); // Losowy seed
+            } else {
+                // Spróbuj przekonwertować string na liczbę
+                try {
+                    g_selectedWorldSeed = std::stoi(g_inputSeedString);
+                } catch (...) {
+                    // Jeśli się nie uda (np. ktoś wpisał "abc"), użyj hasha stringa
+                    g_selectedWorldSeed = static_cast<int>(std::hash<std::string>{}(g_inputSeedString));
+                }
+            }
+            std::cout << "Rozpoczynanie swiata: " << g_selectedWorldName << " (Seed: " << g_selectedWorldSeed << ")" << std::endl;
+            g_currentState = STATE_LOADING_WORLD;
+        }
+        // Kliknięcie "Wstecz"
+        else if (IsMouseOver(mouseX, mouseY, BTN_BACK_X, BTN_BACK_Y, BTN_W, BTN_H)) {
+            g_currentState = STATE_MAIN_MENU;
+        }
+        return;
+    }
+    // --- KONIEC NOWEGO BLOKU ---
+    // === OBSŁUGA STANU GRY ===
+    if (g_currentState != STATE_IN_GAME) return; // Nic nie rób, jeśli nie jesteśmy w grze
+
+    // --- STARY KOD (zaczyna się od linii 1088) ---
+    glm::vec3 eyePos = camera.Position + glm::vec3(0.0f, PLAYER_EYE_HEIGHT, 0.0f);
     glm::ivec3 hitBlockPos;
     glm::ivec3 prevBlockPos;
     float raycastDistance = 5.0f;
 
     bool hit = Raycast(eyePos, camera.Front, raycastDistance, hitBlockPos, prevBlockPos);
-    g_raycastHit = hit; // Zapisz globalnie dla highlightera
+    g_raycastHit = hit;
 
     if (hit && action == GLFW_PRESS)
     {
         if (button == GLFW_MOUSE_BUTTON_LEFT)
         {
-            // --- NISZCZENIE ---
             uint8_t blockToDestroy = GetBlockGlobal(hitBlockPos.x, hitBlockPos.y, hitBlockPos.z);
             if (blockToDestroy != BLOCK_ID_AIR && blockToDestroy != BLOCK_ID_WATER) {
                 if (blockToDestroy==BLOCK_ID_BEDROCK && camera.flyingMode ) {
@@ -1159,12 +1449,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
         }
         else if (button == GLFW_MOUSE_BUTTON_RIGHT)
         {
-            // --- BUDOWANIE ---
-
-            // POPRAWKA: Sprawdź, czy można budować w tym miejscu
             uint8_t blockToPlaceIn = GetBlockGlobal(prevBlockPos.x, prevBlockPos.y, prevBlockPos.z);
-
-            // Możemy budować tylko w powietrzu lub zastępować wodę (jeśli nie trzymamy wody)
             if (blockToPlaceIn == BLOCK_ID_AIR || (blockToPlaceIn == BLOCK_ID_WATER && g_selectedBlockID != BLOCK_ID_WATER))
             {
                 SetBlock(prevBlockPos.x, prevBlockPos.y, prevBlockPos.z, g_selectedBlockID);
@@ -1188,4 +1473,99 @@ void scroll_callback(GLFWwindow* window, double xoffset, double yoffset)
     g_selectedBlockID = g_hotbarSlots[g_activeSlot];
 
     std::cout << "Wybrano slot: " << g_activeSlot + 1 << " (Block ID: " << g_selectedBlockID << ")" << std::endl;
+}
+
+void DrawMenuButton(Shader& uiShader, unsigned int vao, unsigned int textureID, float x, float y, float w, float h) {
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, textureID);
+
+    glm::mat4 model = glm::mat4(1.0f);
+    model = glm::translate(model, glm::vec3(x, y, 0.0f));
+    model = glm::scale(model, glm::vec3(w, h, 1.0f));
+    uiShader.setMat4("model", model);
+
+    glBindVertexArray(vao);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+}
+
+bool IsMouseOver(double mouseX, double mouseY, float x, float y, float w, float h) {
+    // Musimy odwrócić Y myszy (GLFW liczy od góry, OpenGL od dołu)
+    mouseY = SCR_HEIGHT - mouseY;
+    return (mouseX >= x && mouseX <= x + w && mouseY >= y && mouseY <= y + h);
+}
+
+void char_callback(GLFWwindow* window, unsigned int codepoint)
+{
+    if (g_currentState != STATE_NEW_WORLD_MENU) return;
+
+    std::string* targetString = nullptr;
+    if (g_activeInput == 0) {
+        targetString = &g_inputWorldName;
+    } else if (g_activeInput == 1) {
+        targetString = &g_inputSeedString;
+    }
+
+    if (targetString && codepoint >= 32 && codepoint <= 126) {
+        // Dodaj znak do stringa (tylko podstawowe ASCII)
+        *targetString += static_cast<char>(codepoint);
+        std::cout << "Tekst: " << *targetString << std::endl; // Do debugowania
+    }
+}
+
+// Callback dla klawiszy specjalnych (Backspace, Tab)
+void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
+{
+    if (g_currentState != STATE_NEW_WORLD_MENU || (action != GLFW_PRESS && action != GLFW_REPEAT)) return;
+
+    std::string* targetString = nullptr;
+    if (g_activeInput == 0) targetString = &g_inputWorldName;
+    else if (g_activeInput == 1) targetString = &g_inputSeedString;
+
+    if (key == GLFW_KEY_BACKSPACE && targetString && !targetString->empty()) {
+        targetString->pop_back();
+        std::cout << "Tekst: " << *targetString << std::endl; // Do debugowania
+    }
+
+    if (key == GLFW_KEY_TAB && action == GLFW_PRESS) {
+        g_activeInput = (g_activeInput + 1) % 2; // Zmień pole (0 -> 1, 1 -> 0)
+    }
+}
+void RenderText(Shader& shader, unsigned int vao, const std::string& text,
+                float x, float y, float size)
+{
+    // Używamy tekstury czcionki (załóżmy, że jest już zbindowana, ale dla pewności...)
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texFont);
+    shader.setInt("uiTexture", 0);
+
+    glBindVertexArray(vao);
+
+    // Ustawiamy stały rozmiar UV dla pojedynczego znaku
+    shader.setVec2("u_uvScale", 1.0f / FONT_ATLAS_COLS, 1.0f / FONT_ATLAS_ROWS);
+
+    float cursor_x = x;
+
+    for (char c : text)
+    {
+        // Pomiń znaki spoza naszego atlasu (ASCII 0-127)
+        if (c < 0) continue;
+        int ascii = static_cast<int>(c);
+        if (ascii >= 128) continue; // Nasz atlas ma 128 znaków
+
+        // Oblicz offset UV w atlasie
+        float uv_x_offset = (ascii % static_cast<int>(FONT_ATLAS_COLS));
+        float uv_y_offset = (ascii / static_cast<int>(FONT_ATLAS_COLS)); // Dzielenie całkowite przez szerokość da nam wiersz
+
+        // Przesuń offset UV do odpowiedniego znaku
+        shader.setVec2("u_uvOffset", uv_x_offset / FONT_ATLAS_COLS, (FONT_ATLAS_ROWS - 1.0 - uv_y_offset) / FONT_ATLAS_ROWS);
+        // Ustaw macierz modelu dla tego znaku
+        glm::mat4 model = glm::mat4(1.0f);
+        model = glm::translate(model, glm::vec3(cursor_x, y, 0.0f));
+        model = glm::scale(model, glm::vec3(size, size, 1.0f));
+        shader.setMat4("model", model);
+
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        // Przesuń kursor w prawo. Możesz dostosować '0.6f', jeśli znaki są zbyt blisko/daleko
+        cursor_x += (size * 0.6f);
+    }
 }

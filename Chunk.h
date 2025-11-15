@@ -161,17 +161,24 @@ public:
                 float globalX = (float)x + position.x;
                 float globalZ = (float)z + position.z;
 
-                // POPRAWKA: Użyj worldSeed (lub wariacji) dla każdego wywołania szumu
-                float baseNoise = stb_perlin_noise3(globalX * terrainNoiseZoom, 0.0f, globalZ * terrainNoiseZoom, 0, 0, worldSeed);
-                float detailNoise = stb_perlin_noise3(globalX * detailNoiseZoom, 0.0f, globalZ * detailNoiseZoom, 0, 0, worldSeed + 1);
+                // --- POPRAWKA: Używamy seeda jako offsetu Y ---
+                float seed_offset = (float)worldSeed;
+
+                // (Stare wywołanie: ..., 0.0f, ..., 0, 0, worldSeed)
+                float baseNoise = stb_perlin_noise3(globalX * terrainNoiseZoom, seed_offset, globalZ * terrainNoiseZoom, 0, 0, 0);
+
+                // (Stare wywołanie: ..., 0.0f, ..., 0, 0, worldSeed + 1)
+                float detailNoise = stb_perlin_noise3(globalX * detailNoiseZoom, seed_offset + 1000.0f, globalZ * detailNoiseZoom, 0, 0, 0);
+
                 float combinedNoise = baseNoise + (detailNoise * 0.25f);
                 int terrainHeight = (int)(baseHeight + (combinedNoise * terrainAmplitude));
                 heightMap[x][z] = terrainHeight;
 
-                float bedrockNoise = stb_perlin_noise3(globalX * bedrockNoiseZoom, 0.0f, globalZ * bedrockNoiseZoom, 0, 0, worldSeed + 2);
+                // (Stare wywołanie: ..., 0.0f, ..., 0, 0, worldSeed + 2)
+                float bedrockNoise = stb_perlin_noise3(globalX * bedrockNoiseZoom, seed_offset + 2000.0f, globalZ * bedrockNoiseZoom, 0, 0, 0);
 
                 for (int y = 0; y < CHUNK_HEIGHT; y++) {
-
+                    // ... (reszta pętli 'y' bez zmian) ...
                     uint8_t blockID = BLOCK_ID_AIR; // Domyślnie
 
                     if (y == 0) {
@@ -201,8 +208,11 @@ public:
                         float globalZ = (float)z + position.z;
                         float globalY = (float)y;
 
-                        // POPRAWKA: Użyj worldSeed
-                        float cavernValue = stb_perlin_noise3(globalX * cavernNoiseZoom, globalY * cavernNoiseZoom, globalZ * cavernNoiseZoom, 0, 0, worldSeed + 3);
+                        // --- POPRAWKA: worldSeed jest już w globalX/Z, ale dodajemy go też do Y ---
+                        float seed_offset = (float)worldSeed;
+
+                        // (Stare wywołanie: ..., 0, 0, worldSeed + 3)
+                        float cavernValue = stb_perlin_noise3(globalX * cavernNoiseZoom, (globalY * cavernNoiseZoom) + seed_offset + 3000.0f, globalZ * cavernNoiseZoom, 0, 0, 0);
                         if (cavernValue > cavernThreshold) blocks[x][y][z] = BLOCK_ID_AIR;
                     }
                 }
@@ -219,19 +229,22 @@ public:
                         float globalZ = (float)z + position.z;
                         float globalY = (float)y;
 
+                        // --- POPRAWKA: Używamy seeda jako offsetu Y ---
+                        float seed_offset = (float)worldSeed;
+
                         if (y > terrainHeight && terrainHeight < SEA_LEVEL && y <= SEA_LEVEL) {
-                             blocks[x][y][z] = BLOCK_ID_WATER;
+                            blocks[x][y][z] = BLOCK_ID_WATER;
                         }
                         else if (y <= terrainHeight && y <= CAVE_WATER_LEVEL) {
-                            // POPRAWKA: Użyj worldSeed
-                            float aquiferNoise = stb_perlin_noise3(globalX * aquiferNoiseZoom, globalY * 0.1f, globalZ * aquiferNoiseZoom, 0, 0, worldSeed + 4);
+                            // (Stare wywołanie: ..., 0, 0, worldSeed + 4)
+                            float aquiferNoise = stb_perlin_noise3(globalX * aquiferNoiseZoom, (globalY * 0.1f) + seed_offset + 4000.0f, globalZ * aquiferNoiseZoom, 0, 0, 0);
                             if (aquiferNoise > aquiferThreshold) blocks[x][y][z] = BLOCK_ID_WATER;
                         }
                     }
                 }
             }
         }
-    } // Koniec konstruktora
+    }
     // "Mądry" getBlock (bez zmian)
     uint8_t getBlock(int x, int y, int z) {
         if (y < 0 || y >= CHUNK_HEIGHT) return BLOCK_ID_AIR;

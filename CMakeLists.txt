@@ -89,6 +89,12 @@ set(ASSET_FILES
         ${PROJECT_SOURCE_DIR}/ui_selector.png
         ${PROJECT_SOURCE_DIR}/ui_icons.png
         ${PROJECT_SOURCE_DIR}/loading.png
+        ${PROJECT_SOURCE_DIR}/button_quit.png
+        ${PROJECT_SOURCE_DIR}/button_load_world.png
+        ${PROJECT_SOURCE_DIR}/button_new_world.png
+        ${PROJECT_SOURCE_DIR}/button_back.png
+        ${PROJECT_SOURCE_DIR}/button_start.png
+        ${PROJECT_SOURCE_DIR}/font.png
 )
 
 # Kopiuj te pliki do folderu docelowego (gdzie jest .exe)
