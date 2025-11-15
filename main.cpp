@@ -211,6 +211,8 @@ unsigned int loadUITexture(const char* path)
 
 const int RENDER_DISTANCE = 12;
 const glm::vec3 SKY_COLOR(0.5f, 0.8f, 1.0f);
+const std::string G_WORLD_NAME = "MojPierwszySwiat";
+const int G_WORLD_SEED = 12345; // Zmień tę liczbę, aby dostać inny świat
 // --- KONIEC NOWOŚCI ---
 float lastY = SCR_HEIGHT / 2.0f;
 bool firstMouse = true;
@@ -263,7 +265,7 @@ glm::ivec3 g_hitBlockPos; // Pozycja trafionego bloku
 glm::ivec3 g_prevBlockPos; // Pozycja "przed" trafieniem
 const float SLOT_SIZE = 64.0f;
 const float SELECTOR_SIZE = 70.0f;
-const float GAP = 8.0f;
+const float GAP = 0.0f;
 const float BAR_WIDTH = (SLOT_SIZE * HOTBAR_SIZE) + (GAP * (HOTBAR_SIZE - 1));
 const float BAR_START_X = (SCR_WIDTH - BAR_WIDTH) / 2.0f; // Wyśrodkowanie paska
 const float ICON_ATLAS_COLS = 8.0f; // Ile jest ikonek w rzędzie w pliku ui_icons.png
@@ -279,12 +281,16 @@ int main()
         -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f
     };
     g_selectedBlockID = g_hotbarSlots[g_activeSlot];
-    if (!std::filesystem::exists("world")) {
+    std::string worldFolderPath = "worlds/" + G_WORLD_NAME;
+    if (!std::filesystem::exists("worlds")) {
+        std::filesystem::create_directory("worlds");
+    }
+    if (!std::filesystem::exists(worldFolderPath)) {
         try {
-            std::filesystem::create_directory("world");
-            std::cout << "Utworzono folder 'world/'" << std::endl;
+            std::filesystem::create_directory(worldFolderPath);
+            std::cout << "Utworzono folder swiata: '" << worldFolderPath << "'" << std::endl;
         } catch (const std::filesystem::filesystem_error& e) {
-            std::cout << "Blad: Nie mozna utworzyc folderu 'world/': " << e.what() << std::endl;
+            std::cout << "Blad: Nie mozna utworzyc folderu swiata: " << e.what() << std::endl;
         }
     }
     // --- 1. Inicjalizacja ---
@@ -512,7 +518,7 @@ int main()
             for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
                 glm::ivec2 chunkPos(x, z);
                 if (g_WorldChunks.find(chunkPos) == g_WorldChunks.end()) {
-                    chunk_storage.emplace_back(glm::vec3(x * CHUNK_WIDTH, 0.0f, z * CHUNK_DEPTH));
+                    chunk_storage.emplace_back(glm::vec3(x * CHUNK_WIDTH, 0.0f, z * CHUNK_DEPTH), G_WORLD_NAME, G_WORLD_SEED);
                     Chunk* newChunk = &chunk_storage.back();
                     g_WorldChunks[chunkPos] = newChunk;
                     chunksToBuild.push_back(newChunk);
@@ -766,7 +772,7 @@ int main()
             for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
                 glm::ivec2 chunkPos(x, z);
                 if (g_WorldChunks.find(chunkPos) == g_WorldChunks.end()) {
-                    chunk_storage.emplace_back(glm::vec3(x * CHUNK_WIDTH, 0.0f, z * CHUNK_DEPTH));
+                    chunk_storage.emplace_back(glm::vec3(x * CHUNK_WIDTH, 0.0f, z * CHUNK_DEPTH), G_WORLD_NAME, G_WORLD_SEED);
                     Chunk* newChunk = &chunk_storage.back();
                     g_WorldChunks[chunkPos] = newChunk;
                     chunksToBuild.push_back(newChunk);
@@ -1142,9 +1148,13 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
         {
             // --- NISZCZENIE ---
             uint8_t blockToDestroy = GetBlockGlobal(hitBlockPos.x, hitBlockPos.y, hitBlockPos.z);
-            if (blockToDestroy != BLOCK_ID_BEDROCK && blockToDestroy != BLOCK_ID_AIR && blockToDestroy != BLOCK_ID_WATER)
-            {
-                SetBlock(hitBlockPos.x, hitBlockPos.y, hitBlockPos.z, BLOCK_ID_AIR);
+            if (blockToDestroy != BLOCK_ID_AIR && blockToDestroy != BLOCK_ID_WATER) {
+                if (blockToDestroy==BLOCK_ID_BEDROCK && camera.flyingMode ) {
+                    SetBlock(hitBlockPos.x, hitBlockPos.y, hitBlockPos.z, BLOCK_ID_AIR);
+                }
+                else if (blockToDestroy!=BLOCK_ID_BEDROCK){
+                    SetBlock(hitBlockPos.x, hitBlockPos.y, hitBlockPos.z, BLOCK_ID_AIR);
+                }
             }
         }
         else if (button == GLFW_MOUSE_BUTTON_RIGHT)

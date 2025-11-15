@@ -87,7 +87,8 @@ public:
     int vertexCount_solid;
     unsigned int VAO_transparent, VBO_transparent;
     int vertexCount_transparent;
-
+    std::string worldName;
+    int worldSeed;
     glm::vec3 position;
     uint8_t blocks[CHUNK_WIDTH][CHUNK_HEIGHT][CHUNK_DEPTH]{};
 
@@ -96,7 +97,7 @@ public:
     // Zwraca nazwę pliku dla tego chunka, np. "world/chunk_0_16.dat"
     std::string GetChunkFileName() {
         std::stringstream ss;
-        ss << "world/chunk_" << static_cast<int>(position.x) << "_" << static_cast<int>(position.z) << ".dat";
+        ss << "worlds/" << worldName << "/chunk_" << static_cast<int>(position.x) << "_" << static_cast<int>(position.z) << ".dat";
         return ss.str();
     }
 
@@ -128,16 +129,16 @@ public:
         return false;
     }
     // ZASTĄP STARY KONSTRUKTOR TYM NOWYM:
-    explicit Chunk(glm::vec3 pos) :
+    explicit Chunk(glm::vec3 pos, std::string worldName, int worldSeed) :
         VAO_solid(0), VBO_solid(0), vertexCount_solid(0),
         VAO_transparent(0), VBO_transparent(0), vertexCount_transparent(0),
-        position(pos)
+        position(pos), worldName(worldName), worldSeed(worldSeed) // <<< ZAPISZ NOWE ZMIENNE
     {
+        // Spróbuj wczytać z pliku (ta logika jest już poprawna)
         if (LoadFromFile()) {
-            // Plik wczytany pomyślnie. Nie generuj niczego.
-            // (buildMesh() zostanie wywołane z main.cpp)
             return;
         }
+
         // --- Ustawienia Generatora (Duże Komory 5x6) ---
         float terrainNoiseZoom = 0.02f;
         float detailNoiseZoom = 0.08f;
@@ -146,18 +147,11 @@ public:
         float cavernNoiseZoom = 0.03f;
         float cavernThreshold = 0.5f;
         const int caveStartDepth = 5;
-
-        // --- Ustawienia Akwiferów (1 na 20) ---
         const int CAVE_WATER_LEVEL = 10;
         float aquiferNoiseZoom = 0.04f;
         float aquiferThreshold = 0.90f;
-
-        // --- NOWOŚĆ: Ustawienia Bedrocka ---
-        float bedrockNoiseZoom = 0.15f; // Dość gęsty szum
-        float bedrockThreshold = 0.3f;  // Próg (około 35% bloków y=1 to bedrock)
-        // --- KONIEC NOWOŚCI ---
-
-        // Tablica tymczasowa do przechowywania wysokości
+        float bedrockNoiseZoom = 0.15f;
+        float bedrockThreshold = 0.3f;
         int heightMap[CHUNK_WIDTH][CHUNK_DEPTH];
 
         // --- ETAP 1: Generowanie Mapy Wysokości (2D) i Lądu ---
@@ -167,43 +161,32 @@ public:
                 float globalX = (float)x + position.x;
                 float globalZ = (float)z + position.z;
 
-                // Generowanie wysokości 2D (bez zmian)
-                float baseNoise = stb_perlin_noise3(globalX * terrainNoiseZoom, 0.0f, globalZ * terrainNoiseZoom, 0, 0, 0);
-                float detailNoise = stb_perlin_noise3(globalX * detailNoiseZoom, 0.0f, globalZ * detailNoiseZoom, 0, 0, 0);
+                // POPRAWKA: Użyj worldSeed (lub wariacji) dla każdego wywołania szumu
+                float baseNoise = stb_perlin_noise3(globalX * terrainNoiseZoom, 0.0f, globalZ * terrainNoiseZoom, 0, 0, worldSeed);
+                float detailNoise = stb_perlin_noise3(globalX * detailNoiseZoom, 0.0f, globalZ * detailNoiseZoom, 0, 0, worldSeed + 1);
                 float combinedNoise = baseNoise + (detailNoise * 0.25f);
                 int terrainHeight = (int)(baseHeight + (combinedNoise * terrainAmplitude));
                 heightMap[x][z] = terrainHeight;
 
-                // --- NOWOŚĆ: Szum dla Bedrocka (oddzielny) ---
-                float bedrockNoise = stb_perlin_noise3(globalX * bedrockNoiseZoom, 0.0f, globalZ * bedrockNoiseZoom, 0, 0, 0);
+                float bedrockNoise = stb_perlin_noise3(globalX * bedrockNoiseZoom, 0.0f, globalZ * bedrockNoiseZoom, 0, 0, worldSeed + 2);
 
                 for (int y = 0; y < CHUNK_HEIGHT; y++) {
 
                     uint8_t blockID = BLOCK_ID_AIR; // Domyślnie
 
-                    // --- NOWA LOGIKA BEDROCKA ---
                     if (y == 0) {
-                        blockID = BLOCK_ID_BEDROCK; // Warstwa 0 jest zawsze bedrockiem
+                        blockID = BLOCK_ID_BEDROCK;
                     }
-                    else if (y == 1) { // Sprawdź warstwę 1
-                        // Użyj szumu, aby zdecydować, czy dać bedrock czy kamień
-                        if (bedrockNoise > bedrockThreshold) {
-                            blockID = BLOCK_ID_BEDROCK;
-                        } else {
-                            blockID = BLOCK_ID_STONE;
-                        }
+                    else if (y == 1) {
+                        if (bedrockNoise > bedrockThreshold) blockID = BLOCK_ID_BEDROCK;
+                        else blockID = BLOCK_ID_STONE;
                     }
-                    // --- KONIEC LOGIKI BEDROCKA ---
-                    else if (y > terrainHeight) {
-                        blockID = BLOCK_ID_AIR;
-                    } else if (y == terrainHeight) {
+                    else if (y > terrainHeight) blockID = BLOCK_ID_AIR;
+                    else if (y == terrainHeight) {
                         if (y < SEA_LEVEL - 1) blockID = BLOCK_ID_DIRT;
                         else blockID = BLOCK_ID_GRASS;
-                    } else if (y > terrainHeight - 4) {
-                        blockID = BLOCK_ID_DIRT;
-                    } else {
-                        blockID = BLOCK_ID_STONE;
-                    }
+                    } else if (y > terrainHeight - 4) blockID = BLOCK_ID_DIRT;
+                    else blockID = BLOCK_ID_STONE;
                     blocks[x][y][z] = blockID;
                 }
             }
@@ -212,20 +195,15 @@ public:
         // --- ETAP 2: Rzeźbienie Jaskiń (Duże Komory) ---
         for (int x = 0; x < CHUNK_WIDTH; x++) {
             for (int z = 0; z < CHUNK_DEPTH; z++) {
-                // POPRAWKA: Zaczynamy od Y=2 (aby nie niszczyć bedrocka)
                 for (int y = 2; y < heightMap[x][z] - caveStartDepth; y++) {
-                    if (blocks[x][y][z] == BLOCK_ID_STONE || blocks[x][y][z] == BLOCK_ID_DIRT)
-                    {
+                    if (blocks[x][y][z] == BLOCK_ID_STONE || blocks[x][y][z] == BLOCK_ID_DIRT) {
                         float globalX = (float)x + position.x;
                         float globalZ = (float)z + position.z;
                         float globalY = (float)y;
 
-                        // Logika "Dużych Komór" (bez zmian)
-                        float cavernValue = stb_perlin_noise3(globalX * cavernNoiseZoom, globalY * cavernNoiseZoom, globalZ * cavernNoiseZoom, 0, 0, 0);
-                        if (cavernValue > cavernThreshold)
-                        {
-                            blocks[x][y][z] = BLOCK_ID_AIR;
-                        }
+                        // POPRAWKA: Użyj worldSeed
+                        float cavernValue = stb_perlin_noise3(globalX * cavernNoiseZoom, globalY * cavernNoiseZoom, globalZ * cavernNoiseZoom, 0, 0, worldSeed + 3);
+                        if (cavernValue > cavernThreshold) blocks[x][y][z] = BLOCK_ID_AIR;
                     }
                 }
             }
@@ -235,33 +213,25 @@ public:
         for (int x = 0; x < CHUNK_WIDTH; x++) {
             for (int z = 0; z < CHUNK_DEPTH; z++) {
                 int terrainHeight = heightMap[x][z];
-                // POPRAWKA: Zaczynamy od Y=2 (aby nie niszczyć bedrocka)
                 for (int y = 2; y < CHUNK_HEIGHT; y++) {
-                    if (blocks[x][y][z] == BLOCK_ID_AIR)
-                    {
+                    if (blocks[x][y][z] == BLOCK_ID_AIR) {
                         float globalX = (float)x + position.x;
                         float globalZ = (float)z + position.z;
                         float globalY = (float)y;
 
-                        // Logika Akwiferów (bez zmian)
-                        if (y > terrainHeight && terrainHeight < SEA_LEVEL && y <= SEA_LEVEL)
-                        {
+                        if (y > terrainHeight && terrainHeight < SEA_LEVEL && y <= SEA_LEVEL) {
                              blocks[x][y][z] = BLOCK_ID_WATER;
                         }
-                        else if (y <= terrainHeight && y <= CAVE_WATER_LEVEL)
-                        {
-                            float aquiferNoise = stb_perlin_noise3(globalX * aquiferNoiseZoom, globalY * 0.1f, globalZ * aquiferNoiseZoom, 0, 0, 0);
-                            if (aquiferNoise > aquiferThreshold)
-                            {
-                                blocks[x][y][z] = BLOCK_ID_WATER;
-                            }
+                        else if (y <= terrainHeight && y <= CAVE_WATER_LEVEL) {
+                            // POPRAWKA: Użyj worldSeed
+                            float aquiferNoise = stb_perlin_noise3(globalX * aquiferNoiseZoom, globalY * 0.1f, globalZ * aquiferNoiseZoom, 0, 0, worldSeed + 4);
+                            if (aquiferNoise > aquiferThreshold) blocks[x][y][z] = BLOCK_ID_WATER;
                         }
                     }
                 }
             }
         }
-        // (buildMesh() jest wywoływane z main.cpp)
-    }
+    } // Koniec konstruktora
     // "Mądry" getBlock (bez zmian)
     uint8_t getBlock(int x, int y, int z) {
         if (y < 0 || y >= CHUNK_HEIGHT) return BLOCK_ID_AIR;
