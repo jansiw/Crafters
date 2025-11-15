@@ -40,6 +40,7 @@ if(WIN32)
             gdi32       # Wymagane przez GLFW na Windows
             user32      # Wymagane przez GLFW na Windows
             shell32     # Wymagane przez GLFW na Windows
+            stdc++fs
     )
     # Dla macOS
 elseif(APPLE)
@@ -87,6 +88,7 @@ set(ASSET_FILES
         ${PROJECT_SOURCE_DIR}/ui_slot.png
         ${PROJECT_SOURCE_DIR}/ui_selector.png
         ${PROJECT_SOURCE_DIR}/ui_icons.png
+        ${PROJECT_SOURCE_DIR}/loading.png
 )
 
 # Kopiuj te pliki do folderu docelowego (gdzie jest .exe)

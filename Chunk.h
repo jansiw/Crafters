@@ -7,6 +7,11 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/integer.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <cmath> // <<< NOWOŚĆ
+#include <fstream>  // <<< NOWOŚĆ (Do zapisu/odczytu plików)
+#include <string>   // <<< NOWOŚĆ
+#include <sstream>  // <<< NOWOŚĆ (Do budowania nazw plików)
+#include <filesystem> // <<< NOWOŚĆ (Do sprawdzania, czy plik istnieje)
 #include "Shader.h"
 // STB_PERLIN jest dołączany z main.cpp
 
@@ -20,6 +25,7 @@ const int SEA_LEVEL = 32;
 #define BLOCK_ID_DIRT 2
 #define BLOCK_ID_STONE 3
 #define BLOCK_ID_WATER 4
+#define BLOCK_ID_BEDROCK 5 // <<< NOWY BLOK
 
 // --- Definicje Atlasu (bez zmian) ---
 const float ATLAS_COLS = 2.0f;
@@ -31,6 +37,7 @@ const float UV_GRASS_SIDE[2] = { 1.0f * UV_STEP_U, 2.0f * UV_STEP_V };
 const float UV_DIRT[2] = { 0.0f * UV_STEP_U, 1.0f * UV_STEP_V };
 const float UV_STONE[2] = { 1.0f * UV_STEP_U, 1.0f * UV_STEP_V };
 const float UV_WATER[2] = { 0.0f * UV_STEP_U, 0.0f * UV_STEP_V };
+const float UV_BEDROCK[2] = { 1.0f * UV_STEP_U, 0.0f * UV_STEP_V };    // <<< NOWOŚĆ: Dół-Prawo
 
 // --- Dane Geometrii (Poprawna wersja, bez zmian) ---
 const float baseFaces[][18] = {
@@ -84,36 +91,177 @@ public:
     glm::vec3 position;
     uint8_t blocks[CHUNK_WIDTH][CHUNK_HEIGHT][CHUNK_DEPTH]{};
 
-    // Inicjalizuj wszystkie nowe zmienne
+    // --- NOWOŚĆ: Funkcje Zapisu/Odczytu ---
+
+    // Zwraca nazwę pliku dla tego chunka, np. "world/chunk_0_16.dat"
+    std::string GetChunkFileName() {
+        std::stringstream ss;
+        ss << "world/chunk_" << static_cast<int>(position.x) << "_" << static_cast<int>(position.z) << ".dat";
+        return ss.str();
+    }
+
+    // Zapisuje tablicę 'blocks' do pliku binarnego
+    void SaveToFile() {
+        std::string fileName = GetChunkFileName();
+        std::ofstream outFile(fileName, std::ios::binary);
+        if (outFile.is_open()) {
+            // Zapisz 16384 bajtów (16*64*16) bezpośrednio z pamięci do pliku
+            outFile.write(reinterpret_cast<char*>(blocks), sizeof(blocks));
+            outFile.close();
+        }
+    }
+
+    // Wczytuje dane z pliku binarnego do tablicy 'blocks'
+    bool LoadFromFile() {
+        std::string fileName = GetChunkFileName();
+        if (!std::filesystem::exists(fileName)) {
+            return false; // Plik nie istnieje, musimy go wygenerować
+        }
+
+        std::ifstream inFile(fileName, std::ios::binary);
+        if (inFile.is_open()) {
+            // Wczytaj 16384 bajtów z pliku prosto do pamięci
+            inFile.read(reinterpret_cast<char*>(blocks), sizeof(blocks));
+            inFile.close();
+            return true; // Wczytano pomyślnie
+        }
+        return false;
+    }
+    // ZASTĄP STARY KONSTRUKTOR TYM NOWYM:
     explicit Chunk(glm::vec3 pos) :
         VAO_solid(0), VBO_solid(0), vertexCount_solid(0),
         VAO_transparent(0), VBO_transparent(0), vertexCount_transparent(0),
         position(pos)
     {
-        // Generowanie terenu (bez zmian)
+        if (LoadFromFile()) {
+            // Plik wczytany pomyślnie. Nie generuj niczego.
+            // (buildMesh() zostanie wywołane z main.cpp)
+            return;
+        }
+        // --- Ustawienia Generatora (Duże Komory 5x6) ---
+        float terrainNoiseZoom = 0.02f;
+        float detailNoiseZoom = 0.08f;
+        float terrainAmplitude = 16.0f;
+        float baseHeight = 32.0f;
+        float cavernNoiseZoom = 0.03f;
+        float cavernThreshold = 0.5f;
+        const int caveStartDepth = 5;
+
+        // --- Ustawienia Akwiferów (1 na 20) ---
+        const int CAVE_WATER_LEVEL = 10;
+        float aquiferNoiseZoom = 0.04f;
+        float aquiferThreshold = 0.90f;
+
+        // --- NOWOŚĆ: Ustawienia Bedrocka ---
+        float bedrockNoiseZoom = 0.15f; // Dość gęsty szum
+        float bedrockThreshold = 0.3f;  // Próg (około 35% bloków y=1 to bedrock)
+        // --- KONIEC NOWOŚCI ---
+
+        // Tablica tymczasowa do przechowywania wysokości
+        int heightMap[CHUNK_WIDTH][CHUNK_DEPTH];
+
+        // --- ETAP 1: Generowanie Mapy Wysokości (2D) i Lądu ---
         for (int x = 0; x < CHUNK_WIDTH; x++) {
             for (int z = 0; z < CHUNK_DEPTH; z++) {
+
                 float globalX = (float)x + position.x;
                 float globalZ = (float)z + position.z;
-                float noise = stb_perlin_noise3(globalX * 0.02f, 0.0f, globalZ * 0.02f, 0, 0, 0);
-                int terrainHeight = (int)(((noise + 1.0f) / 2.0f) * 32.0f) + 16;
+
+                // Generowanie wysokości 2D (bez zmian)
+                float baseNoise = stb_perlin_noise3(globalX * terrainNoiseZoom, 0.0f, globalZ * terrainNoiseZoom, 0, 0, 0);
+                float detailNoise = stb_perlin_noise3(globalX * detailNoiseZoom, 0.0f, globalZ * detailNoiseZoom, 0, 0, 0);
+                float combinedNoise = baseNoise + (detailNoise * 0.25f);
+                int terrainHeight = (int)(baseHeight + (combinedNoise * terrainAmplitude));
+                heightMap[x][z] = terrainHeight;
+
+                // --- NOWOŚĆ: Szum dla Bedrocka (oddzielny) ---
+                float bedrockNoise = stb_perlin_noise3(globalX * bedrockNoiseZoom, 0.0f, globalZ * bedrockNoiseZoom, 0, 0, 0);
+
                 for (int y = 0; y < CHUNK_HEIGHT; y++) {
-                    if (y > terrainHeight) {
-                        if (y <= SEA_LEVEL) blocks[x][y][z] = BLOCK_ID_WATER;
-                        else blocks[x][y][z] = BLOCK_ID_AIR;
+
+                    uint8_t blockID = BLOCK_ID_AIR; // Domyślnie
+
+                    // --- NOWA LOGIKA BEDROCKA ---
+                    if (y == 0) {
+                        blockID = BLOCK_ID_BEDROCK; // Warstwa 0 jest zawsze bedrockiem
+                    }
+                    else if (y == 1) { // Sprawdź warstwę 1
+                        // Użyj szumu, aby zdecydować, czy dać bedrock czy kamień
+                        if (bedrockNoise > bedrockThreshold) {
+                            blockID = BLOCK_ID_BEDROCK;
+                        } else {
+                            blockID = BLOCK_ID_STONE;
+                        }
+                    }
+                    // --- KONIEC LOGIKI BEDROCKA ---
+                    else if (y > terrainHeight) {
+                        blockID = BLOCK_ID_AIR;
                     } else if (y == terrainHeight) {
-                        if (y < SEA_LEVEL - 1) blocks[x][y][z] = BLOCK_ID_DIRT;
-                        else blocks[x][y][z] = BLOCK_ID_GRASS;
+                        if (y < SEA_LEVEL - 1) blockID = BLOCK_ID_DIRT;
+                        else blockID = BLOCK_ID_GRASS;
                     } else if (y > terrainHeight - 4) {
-                        blocks[x][y][z] = BLOCK_ID_DIRT;
+                        blockID = BLOCK_ID_DIRT;
                     } else {
-                        blocks[x][y][z] = BLOCK_ID_STONE;
+                        blockID = BLOCK_ID_STONE;
+                    }
+                    blocks[x][y][z] = blockID;
+                }
+            }
+        }
+
+        // --- ETAP 2: Rzeźbienie Jaskiń (Duże Komory) ---
+        for (int x = 0; x < CHUNK_WIDTH; x++) {
+            for (int z = 0; z < CHUNK_DEPTH; z++) {
+                // POPRAWKA: Zaczynamy od Y=2 (aby nie niszczyć bedrocka)
+                for (int y = 2; y < heightMap[x][z] - caveStartDepth; y++) {
+                    if (blocks[x][y][z] == BLOCK_ID_STONE || blocks[x][y][z] == BLOCK_ID_DIRT)
+                    {
+                        float globalX = (float)x + position.x;
+                        float globalZ = (float)z + position.z;
+                        float globalY = (float)y;
+
+                        // Logika "Dużych Komór" (bez zmian)
+                        float cavernValue = stb_perlin_noise3(globalX * cavernNoiseZoom, globalY * cavernNoiseZoom, globalZ * cavernNoiseZoom, 0, 0, 0);
+                        if (cavernValue > cavernThreshold)
+                        {
+                            blocks[x][y][z] = BLOCK_ID_AIR;
+                        }
                     }
                 }
             }
         }
-    }
 
+        // --- ETAP 3: Generowanie Wody (z Rzadkimi Akwiferami) ---
+        for (int x = 0; x < CHUNK_WIDTH; x++) {
+            for (int z = 0; z < CHUNK_DEPTH; z++) {
+                int terrainHeight = heightMap[x][z];
+                // POPRAWKA: Zaczynamy od Y=2 (aby nie niszczyć bedrocka)
+                for (int y = 2; y < CHUNK_HEIGHT; y++) {
+                    if (blocks[x][y][z] == BLOCK_ID_AIR)
+                    {
+                        float globalX = (float)x + position.x;
+                        float globalZ = (float)z + position.z;
+                        float globalY = (float)y;
+
+                        // Logika Akwiferów (bez zmian)
+                        if (y > terrainHeight && terrainHeight < SEA_LEVEL && y <= SEA_LEVEL)
+                        {
+                             blocks[x][y][z] = BLOCK_ID_WATER;
+                        }
+                        else if (y <= terrainHeight && y <= CAVE_WATER_LEVEL)
+                        {
+                            float aquiferNoise = stb_perlin_noise3(globalX * aquiferNoiseZoom, globalY * 0.1f, globalZ * aquiferNoiseZoom, 0, 0, 0);
+                            if (aquiferNoise > aquiferThreshold)
+                            {
+                                blocks[x][y][z] = BLOCK_ID_WATER;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // (buildMesh() jest wywoływane z main.cpp)
+    }
     // "Mądry" getBlock (bez zmian)
     uint8_t getBlock(int x, int y, int z) {
         if (y < 0 || y >= CHUNK_HEIGHT) return BLOCK_ID_AIR;
@@ -214,16 +362,29 @@ public:
 
     // addFaceToMesh (bez zmian)
     void addFaceToMesh(std::vector<float>& mesh, int faceIndex, int x, int y, int z, uint8_t blockID) {
+
         const float* uvBase;
+
         if (blockID == BLOCK_ID_GRASS) {
             if (faceIndex == 0) uvBase = UV_GRASS_TOP;
             else if (faceIndex == 1) uvBase = UV_DIRT;
             else uvBase = UV_GRASS_SIDE;
         }
-        else if (blockID == BLOCK_ID_DIRT) uvBase = UV_DIRT;
-        else if (blockID == BLOCK_ID_STONE) uvBase = UV_STONE;
-        else if (blockID == BLOCK_ID_WATER) uvBase = UV_WATER;
-        else return;
+        else if (blockID == BLOCK_ID_DIRT) {
+            uvBase = UV_DIRT;
+        }
+        else if (blockID == BLOCK_ID_STONE) {
+            uvBase = UV_STONE;
+        }
+        else if (blockID == BLOCK_ID_WATER) {
+            uvBase = UV_WATER;
+        }
+        else if (blockID == BLOCK_ID_BEDROCK) { // <<< NOWOŚĆ
+            uvBase = UV_BEDROCK;
+        }
+        else {
+            return; // Nieznany blok
+        }
 
         float u_start = uvBase[0];
         float v_start = uvBase[1];

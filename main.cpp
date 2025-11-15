@@ -7,6 +7,8 @@
 #include <glm/gtc/integer.hpp> // <<< NOWOŚĆ (dla klucza mapy)
 #include <vector>
 #include <cmath> // Upewnij się, że to masz
+#include <filesystem> // <<< NOWOŚĆ
+#include <sstream>    // <<< NOWOŚĆ
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -217,13 +219,15 @@ const float GRAVITY = -18.0f;
 const float JUMP_FORCE = 7.0f;
 const float PLAYER_HEIGHT = 1.8f; // Całkowita wysokość gracza (od stóp do czubka głowy)
 const int HOTBAR_SIZE = 9;
+const float BUOYANCY = 9.0f;    // Siła wyporu (trochę słabsza niż grawitacja)
+const float WATER_DRAG = 0.85f; // Spowolnienie w wodzie
 // Tablica ID bloków w pasku (indeks 0 to slot 1, itd.)
 const uint8_t g_hotbarSlots[HOTBAR_SIZE] = {
     BLOCK_ID_GRASS,
     BLOCK_ID_DIRT,
     BLOCK_ID_STONE,
     BLOCK_ID_WATER,
-    BLOCK_ID_GRASS,
+    BLOCK_ID_BEDROCK,
     BLOCK_ID_DIRT,
     BLOCK_ID_STONE,
     BLOCK_ID_WATER,
@@ -253,6 +257,7 @@ unsigned int slotTextureID;      // ID dla ui_slot.png
 unsigned int selectorTextureID;  // ID dla ui_selector.png// Nowy shader
 // --- KONIEC NOWOŚCI ---
 unsigned int iconsTextureID;
+unsigned int loadingTextureID;
 bool g_raycastHit = false; // Czy raycast w ogóle w coś trafił?
 glm::ivec3 g_hitBlockPos; // Pozycja trafionego bloku
 glm::ivec3 g_prevBlockPos; // Pozycja "przed" trafieniem
@@ -261,6 +266,8 @@ const float SELECTOR_SIZE = 70.0f;
 const float GAP = 8.0f;
 const float BAR_WIDTH = (SLOT_SIZE * HOTBAR_SIZE) + (GAP * (HOTBAR_SIZE - 1));
 const float BAR_START_X = (SCR_WIDTH - BAR_WIDTH) / 2.0f; // Wyśrodkowanie paska
+const float ICON_ATLAS_COLS = 8.0f; // Ile jest ikonek w rzędzie w pliku ui_icons.png
+const float ICON_ATLAS_ROWS = 1.0f; // Ile jest rzędów
 int main()
 {
     const float G_SKYBOX_VERTICES[] = {
@@ -272,6 +279,14 @@ int main()
         -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f
     };
     g_selectedBlockID = g_hotbarSlots[g_activeSlot];
+    if (!std::filesystem::exists("world")) {
+        try {
+            std::filesystem::create_directory("world");
+            std::cout << "Utworzono folder 'world/'" << std::endl;
+        } catch (const std::filesystem::filesystem_error& e) {
+            std::cout << "Blad: Nie mozna utworzyc folderu 'world/': " << e.what() << std::endl;
+        }
+    }
     // --- 1. Inicjalizacja ---
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -342,6 +357,7 @@ int main()
     slotTextureID = loadUITexture("ui_slot.png");
     selectorTextureID = loadUITexture("ui_selector.png");
     iconsTextureID = loadUITexture("ui_icons.png");
+    loadingTextureID = loadUITexture("loading.png");
     ourShader.use();
     ourShader.setInt("ourTexture", 0);
     Shader crosshairShader("crosshair.vert", "crosshair.frag");
@@ -369,74 +385,34 @@ int main()
     glEnableVertexAttribArray(0);
     glBindVertexArray(0); // Od-binduj
     // --- NOWOŚĆ: KONFIGURACJA HOTBARA (Geometria + VAO) ---
-    std::vector<float> hotbarGeometry;
+    // std::vector<float> hotbarGeometry;
 
-    for (int i = 0; i < HOTBAR_SIZE; i++) {
-        float x_offset = BAR_START_X + i * (SLOT_SIZE + GAP);
-        float y_offset = 10.0f; // 10px od dołu ekranu
+    // --- NOWOŚĆ: KONFIGURACJA HOTBARA (JEDEN KWADRAT) ---
+    // Stworzymy jeden kwadrat "unit quad" od (0,0) do (1,1).
+    // Będziemy go skalować i przesuwać za pomocą macierzy "model".
+    float quadVertices[] = {
+        // Pozycja (X,Y)   // UV
+        0.0f, 0.0f,       0.0f, 0.0f, // Dół-Lewo
+        1.0f, 0.0f,       1.0f, 0.0f, // Dół-Prawo
+        1.0f, 1.0f,       1.0f, 1.0f, // Góra-Prawo
 
-        // --- 1. SLOT TŁA (9 Slotów) ---
-        // Kwadrat 64x64, UV (0,0) do (1,1)
-        hotbarGeometry.push_back(x_offset);               hotbarGeometry.push_back(y_offset);
-        hotbarGeometry.push_back(0.0f);                   hotbarGeometry.push_back(0.0f);                 // UV (0, 0)
-        hotbarGeometry.push_back(x_offset + SLOT_SIZE);   hotbarGeometry.push_back(y_offset);
-        hotbarGeometry.push_back(1.0f);                   hotbarGeometry.push_back(0.0f);                 // UV (1, 0)
-        hotbarGeometry.push_back(x_offset + SLOT_SIZE);   hotbarGeometry.push_back(y_offset + SLOT_SIZE);
-        hotbarGeometry.push_back(1.0f);                   hotbarGeometry.push_back(1.0f);                 // UV (1, 1)
+        0.0f, 0.0f,       0.0f, 0.0f, // Dół-Lewo
+        1.0f, 1.0f,       1.0f, 1.0f, // Góra-Prawo
+        0.0f, 1.0f,       0.0f, 1.0f  // Góra-Lewo
+    };
 
-        hotbarGeometry.push_back(x_offset);               hotbarGeometry.push_back(y_offset);
-        hotbarGeometry.push_back(0.0f);                   hotbarGeometry.push_back(0.0f);                 // UV (0, 0)
-        hotbarGeometry.push_back(x_offset + SLOT_SIZE);   hotbarGeometry.push_back(y_offset + SLOT_SIZE);
-        hotbarGeometry.push_back(1.0f);                   hotbarGeometry.push_back(1.0f);                 // UV (1, 1)
-        hotbarGeometry.push_back(x_offset);               hotbarGeometry.push_back(y_offset + SLOT_SIZE);
-        hotbarGeometry.push_back(0.0f);                   hotbarGeometry.push_back(1.0f);                 // UV (0, 1)
-
-        // --- 2. IKONY BLOKÓW (9 Ikon) ---
-        // Kwadrat 52x52, wyśrodkowany
-        float ICON_SIZE = 52.0f;
-        float icon_x_start = x_offset + (SLOT_SIZE - ICON_SIZE) / 2.0f;
-        float icon_y_start = y_offset + (SLOT_SIZE - ICON_SIZE) / 2.0f;
-
-        // Obliczanie offsetu UV dla ikony z UI_ICONS.png
-        uint8_t blockID = g_hotbarSlots[i];
-
-        // Zakładamy: Ikony są ułożone w rzędzie (0, 1, 2, 3...)
-        float uv_icon_start_u = (blockID - 1) * UV_STEP_U;
-
-        // Geometria ikony (ta sama geometria, ale inne przesunięcia)
-        hotbarGeometry.push_back(icon_x_start);               hotbarGeometry.push_back(icon_y_start);             // V1
-        hotbarGeometry.push_back(uv_icon_start_u);            hotbarGeometry.push_back(0.0f);                     // UV (0, 0)
-        hotbarGeometry.push_back(icon_x_start + ICON_SIZE);   hotbarGeometry.push_back(icon_y_start);             // V2
-        hotbarGeometry.push_back(uv_icon_start_u + UV_STEP_U);hotbarGeometry.push_back(0.0f);                     // UV (1, 0)
-        hotbarGeometry.push_back(icon_x_start + ICON_SIZE);   hotbarGeometry.push_back(icon_y_start + ICON_SIZE); // V3
-        hotbarGeometry.push_back(uv_icon_start_u + UV_STEP_U);hotbarGeometry.push_back(1.0f);                     // UV (1, 1)
-
-        hotbarGeometry.push_back(icon_x_start);               hotbarGeometry.push_back(icon_y_start);             // V4 (V1)
-        hotbarGeometry.push_back(uv_icon_start_u);            hotbarGeometry.push_back(0.0f);                     // UV (0, 0)
-        hotbarGeometry.push_back(icon_x_start + ICON_SIZE);   hotbarGeometry.push_back(icon_y_start + ICON_SIZE); // V5 (V3)
-        hotbarGeometry.push_back(uv_icon_start_u + UV_STEP_U);hotbarGeometry.push_back(1.0f);                     // UV (1, 1)
-        hotbarGeometry.push_back(icon_x_start);               hotbarGeometry.push_back(icon_y_start + ICON_SIZE); // V6
-        hotbarGeometry.push_back(uv_icon_start_u);            hotbarGeometry.push_back(1.0f);                     // UV (0, 1)
-    }
-
-    // --- 3. Stwórz VAO/VBO dla Hotbara ---
     glGenVertexArrays(1, &hotbarVAO);
     glGenBuffers(1, &hotbarVBO);
     glBindVertexArray(hotbarVAO);
     glBindBuffer(GL_ARRAY_BUFFER, hotbarVBO);
-    glBufferData(GL_ARRAY_BUFFER, hotbarGeometry.size() * sizeof(float), hotbarGeometry.data(), GL_STATIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
 
-    // Konfiguracja (4 floaty na wierzchołek: X, Y, U, V)
+    // Atrybuty: 4 floaty (X, Y, U, V)
     GLsizei stride = 4 * sizeof(float);
-
-    // 0: Pozycja (X, Y)
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
     glEnableVertexAttribArray(0);
-
-    // 1: Tekstura (U, V)
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
     glEnableVertexAttribArray(1);
-
     glBindVertexArray(0);
     Shader highlighterShader("highlighter.vert", "highlighter.frag");
 
@@ -497,6 +473,145 @@ int main()
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
     glEnableVertexAttribArray(0);
     glBindVertexArray(0);
+    // ... (kod odglBindVertexArray(0); dla Skyboxa)
+
+    // --- NOWOŚĆ: PĘTLA ŁADOWANIA I WYGASZANIA ---
+    glm::mat4 ortho_projection = glm::ortho(0.0f, (float)SCR_WIDTH, 0.0f, (float)SCR_HEIGHT);
+    std::cout << "Ladowanie poczatkowego obszaru..." << std::endl;
+    {
+        // === ETAP 1: Pokaż statyczny obrazek ładowania ===
+        glDisable(GL_DEPTH_TEST);
+        uiShader.use();
+        uiShader.setMat4("projection", ortho_projection);
+        uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+        uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+        uiShader.setFloat("u_opacity", 1.0f); // W pełni widoczny
+
+        glm::mat4 model = glm::mat4(1.0f);
+        model = glm::scale(model, glm::vec3(SCR_WIDTH, SCR_HEIGHT, 1.0f));
+        uiShader.setMat4("model", model);
+
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // Czarne tło
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        glBindVertexArray(hotbarVAO); // Użyj "pędzla" (unit quad)
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, loadingTextureID);
+        uiShader.setInt("uiTexture", 0);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+
+        // === ETAP 2: Wykonaj całą ciężką pracę (generowanie świata) ===
+        // (Ten kod jest ukryty za ekranem ładowania)
+        int playerChunkX = static_cast<int>(floor(camera.Position.x / CHUNK_WIDTH));
+        int playerChunkZ = static_cast<int>(floor(camera.Position.z / CHUNK_DEPTH));
+        std::vector<Chunk*> chunksToBuild;
+        for (int x = playerChunkX - RENDER_DISTANCE; x <= playerChunkX + RENDER_DISTANCE; x++) {
+            for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
+                glm::ivec2 chunkPos(x, z);
+                if (g_WorldChunks.find(chunkPos) == g_WorldChunks.end()) {
+                    chunk_storage.emplace_back(glm::vec3(x * CHUNK_WIDTH, 0.0f, z * CHUNK_DEPTH));
+                    Chunk* newChunk = &chunk_storage.back();
+                    g_WorldChunks[chunkPos] = newChunk;
+                    chunksToBuild.push_back(newChunk);
+                }
+            }
+        }
+        for (Chunk* chunk : chunksToBuild) {
+            chunk->buildMesh();
+        }
+    }
+    std::cout << "Ladowanie zakonczone. Wygaszanie..." << std::endl;
+
+    // === ETAP 3: Pętla Wygaszania (Fade-out) ===
+    float fadeDuration = 1.0f; // Czas trwania wygaszania (w sekundach)
+    float fadeTimer = fadeDuration;
+
+    // Pobierz czas rozpoczęcia wygaszania
+    float fadeStartTime = static_cast<float>(glfwGetTime());
+    float lastFadeFrame = fadeStartTime;
+
+    while (fadeTimer > 0.0f)
+    {
+        // Oblicz deltaTime dla tej mini-pętli
+        float currentFadeFrame = static_cast<float>(glfwGetTime());
+        float fadeDeltaTime = currentFadeFrame - lastFadeFrame;
+        lastFadeFrame = currentFadeFrame;
+
+        fadeTimer -= fadeDeltaTime;
+        float opacity = fadeTimer / fadeDuration; // Opacity od 1.0 do 0.0
+
+        // --- Rysuj świat (tylko Solid + Skybox) ---
+        // (Musimy narysować to, co jest "pod" ekranem ładowania)
+        glClearColor(SKY_COLOR.x, SKY_COLOR.y, SKY_COLOR.z, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        // Oblicz macierze (tak jak w głównej pętli)
+        float viewDistance = (RENDER_DISTANCE + 1) * CHUNK_WIDTH;
+        glm::mat4 projection = glm::perspective(glm::radians(camera.Zoom), (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, viewDistance);
+        glm::mat4 view = camera.GetViewMatrix();
+
+        // Rysuj Skybox (bez zmian)
+        if (cubemapTexture != 0) {
+            glDepthFunc(GL_LEQUAL);
+            skyboxShader.use();
+            skyboxShader.setMat4("projection", projection);
+            skyboxShader.setMat4("view", glm::mat4(glm::mat3(view)));
+            glBindVertexArray(skyboxVAO);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_CUBE_MAP, cubemapTexture);
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+            glBindVertexArray(0);
+            glDepthFunc(GL_LESS);
+        }
+
+        // Rysuj Solid Pass (Ląd)
+        ourShader.use();
+        ourShader.setMat4("projection", projection);
+        ourShader.setMat4("view", view);
+        // (Ustawienia mgły dla ourShader)
+        float fogStart = (RENDER_DISTANCE - 2) * CHUNK_WIDTH;
+        float fogEnd = (RENDER_DISTANCE + 1) * CHUNK_WIDTH;
+        ourShader.setVec3("u_fogColor", SKY_COLOR);
+        ourShader.setFloat("u_fogStart", fogStart);
+        ourShader.setFloat("u_fogEnd", fogEnd);
+
+        glDepthMask(GL_TRUE);
+        glEnable(GL_CULL_FACE);
+        for (auto const& [pos, chunk] : g_WorldChunks) {
+            chunk->DrawSolid(ourShader, textureAtlas);
+        }
+
+        // --- Rysuj Ekran Ładowania (NA WIERZCHU) ---
+        glDisable(GL_DEPTH_TEST);
+        uiShader.use();
+        uiShader.setMat4("projection", ortho_projection); // Użyj ortho z Etapu 1
+        uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+        uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+        uiShader.setFloat("u_opacity", opacity); // Użyj obliczonej przezroczystości
+
+        glm::mat4 model = glm::mat4(1.0f);
+        model = glm::scale(model, glm::vec3(SCR_WIDTH, SCR_HEIGHT, 1.0f));
+        uiShader.setMat4("model", model);
+
+        glBindVertexArray(hotbarVAO);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, loadingTextureID);
+        uiShader.setInt("uiTexture", 0);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+
+        glEnable(GL_DEPTH_TEST);
+
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
+    // --- KONIEC PĘTLI ŁADOWANIA I WYGASZANIA ---
+
+    // Ustaw czas startowy dla głównej pętli gry
+    lastFrame = static_cast<float>(glfwGetTime());
+
    while (!glfwWindowShouldClose(window))
     {
         // --- 1. OBLICZENIA CZASU I INPUTU ---
@@ -515,57 +630,90 @@ int main()
         }
        // --- NOWOŚĆ: KOMPLETNA PĘTLA FIZYKI (zastępuje starą) ---
        float currentSpeed = camera.MovementSpeed;
-       // Sprawdź, czy lewy control jest wciśnięty
-       if (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS) {
-           currentSpeed *= 1.8f; // Mnożnik sprintu (1.8x szybszy)
-       }
-       if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS && !camera.flyingMode) {
-           currentSpeed *= 0.6f; // Mnożnik sprintu (1.8x szybszy)
-       }
+        if (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS) {
+            currentSpeed *= 1.8f;
+        }
+
+        // --- Sprawdź, czy gracz jest w wodzie ---
+        // Sprawdzamy blok na wysokości "oczu"
+        glm::vec3 headPos = camera.Position + glm::vec3(0.0f, PLAYER_EYE_HEIGHT, 0.0f);
+        bool isInWater = (GetBlockGlobal(round(headPos.x), round(headPos.y), round(headPos.z)) == BLOCK_ID_WATER);
+
+
         if (camera.flyingMode)
         {
             // --- FIZYKA LATANIA (prosta) ---
             camera.Position += wishDir * currentSpeed * deltaTime;
-            onGround = false; // W trybie latania nigdy nie jesteś "na ziemi"
+            onGround = false;
             playerVelocity = glm::vec3(0.0f);
         }
         else
         {
-            // --- FIZYKA CHODZENIA (skomplikowana) ---
+            // --- FIZYKA CHODZENIA I PŁYWANIA ---
 
-            // 1. Zastosuj grawitację
-            if (!onGround) {
-                playerVelocity.y += GRAVITY * deltaTime;
-            }
-
-            // 2. Obsłuż skok
-            if (wishJump && onGround) {
-                playerVelocity.y = JUMP_FORCE;
+            // 1. Zastosuj Grawitację lub Pływalność
+            if (isInWater)
+            {
                 onGround = false;
+                // Zastosuj opór wody (spowolnienie)
+                playerVelocity.y *= (1.0f - WATER_DRAG * deltaTime);
+                // Zastosuj wyporność
+                playerVelocity.y += BUOYANCY * deltaTime;
+
+                // Pływanie w górę (ze Spacji)
+                if (wishJump) {
+                    playerVelocity.y = camera.MovementSpeed * 0.6f; // Prędkość pływania w górę
+                }
+                // Pływanie w dół (z Shifta)
+                if(wishDir.y < 0) {
+                     playerVelocity.y = -camera.MovementSpeed * 0.6f;
+                }
+
+                // Ogranicz prędkość w wodzie
+                playerVelocity.y = glm::clamp(playerVelocity.y, -camera.MovementSpeed * 0.6f, camera.MovementSpeed * 0.6f);
+            }
+            else // Nie jesteśmy w wodzie
+            {
+                // Zastosuj normalną grawitację
+                if (!onGround) {
+                    playerVelocity.y += GRAVITY * deltaTime;
+                }
+                // Obsłuż skok (tylko na lądzie)
+                if (wishJump && onGround) {
+                    playerVelocity.y = JUMP_FORCE;
+                    onGround = false;
+                }
             }
 
-            // 3. Zastosuj "życzenie" ruchu (WSAD) do prędkości
-            playerVelocity.x = wishDir.x * currentSpeed;
-            playerVelocity.z = wishDir.z * currentSpeed;
+            // 2. Zastosuj ruch poziomy (WSAD)
+            float speedMultiplier = isInWater ? 0.5f : 1.0f; // 50% prędkości w wodzie
+            playerVelocity.x = wishDir.x * currentSpeed * speedMultiplier;
+            playerVelocity.z = wishDir.z * currentSpeed * speedMultiplier;
 
-            // 4. Oblicz nową pozycję
+            // 3. Oblicz nową pozycję
             glm::vec3 newPos = camera.Position + playerVelocity * deltaTime;
 
-            // 5. Sprawdź kolizje (prosty AABB)
-            // Sprawdzamy 2 punkty na wysokości (stopy i głowa)
+            // 4. Sprawdź kolizje (prosty AABB)
+
+            // Funkcja pomocnicza sprawdzająca, czy blok jest SOLIDNY
+            auto isSolid = [&](int x, int y, int z) {
+                uint8_t block = GetBlockGlobal(x, y, z);
+                return block != BLOCK_ID_AIR && block != BLOCK_ID_WATER;
+            };
+
             float playerWidthHalf = PLAYER_WIDTH / 2.0f;
             glm::vec3 feetCheck = newPos;
             glm::vec3 headCheck = newPos + glm::vec3(0.0f, PLAYER_HEIGHT, 0.0f);
 
             // Kolizja w osi Y (Góra/Dół)
-            if (playerVelocity.y > 0) { // Lecimy w GÓRĘ (skok)
-                if (GetBlockGlobal(round(headCheck.x), round(headCheck.y), round(headCheck.z)) != BLOCK_ID_AIR) {
+            if (playerVelocity.y > 0) { // Lecimy w GÓRĘ
+                if (isSolid(round(headCheck.x), round(headCheck.y), round(headCheck.z))) {
                     playerVelocity.y = 0; // Uderzyliśmy w sufit
                 }
-            } else { // Lecimy w DÓŁ (grawitacja)
-                if (GetBlockGlobal(round(feetCheck.x), round(feetCheck.y - 0.1f), round(feetCheck.z)) != BLOCK_ID_AIR) {
+            } else { // Lecimy w DÓŁ
+                if (isSolid(round(feetCheck.x), round(feetCheck.y - 0.1f), round(feetCheck.z))) {
                     playerVelocity.y = 0;
-                    onGround = true;
+                    onGround = true; // Jesteśmy na ziemi (nie w wodzie)
                     newPos.y = round(feetCheck.y - 0.1f) + 0.5f; // Ląduj na bloku
                 } else {
                     onGround = false;
@@ -574,31 +722,31 @@ int main()
 
             // Kolizja w osi X
             if (playerVelocity.x > 0) { // Idziemy w prawo (+X)
-                if (GetBlockGlobal(round(feetCheck.x + playerWidthHalf), round(feetCheck.y), round(feetCheck.z)) != BLOCK_ID_AIR ||
-                    GetBlockGlobal(round(headCheck.x + playerWidthHalf), round(headCheck.y), round(headCheck.z)) != BLOCK_ID_AIR) {
-                    newPos.x = camera.Position.x; // Zablokuj ruch X
+                if (isSolid(round(feetCheck.x + playerWidthHalf), round(feetCheck.y), round(feetCheck.z)) ||
+                    isSolid(round(headCheck.x + playerWidthHalf), round(headCheck.y), round(headCheck.z))) {
+                    newPos.x = camera.Position.x;
                 }
             } else if (playerVelocity.x < 0) { // Idziemy w lewo (-X)
-                if (GetBlockGlobal(round(feetCheck.x - playerWidthHalf), round(feetCheck.y), round(feetCheck.z)) != BLOCK_ID_AIR ||
-                    GetBlockGlobal(round(headCheck.x - playerWidthHalf), round(headCheck.y), round(headCheck.z)) != BLOCK_ID_AIR) {
-                    newPos.x = camera.Position.x; // Zablokuj ruch X
+                if (isSolid(round(feetCheck.x - playerWidthHalf), round(feetCheck.y), round(feetCheck.z)) ||
+                    isSolid(round(headCheck.x - playerWidthHalf), round(headCheck.y), round(headCheck.z))) {
+                    newPos.x = camera.Position.x;
                 }
             }
 
             // Kolizja w osi Z
             if (playerVelocity.z > 0) { // Idziemy do przodu (+Z)
-                if (GetBlockGlobal(round(feetCheck.x), round(feetCheck.y), round(feetCheck.z + playerWidthHalf)) != BLOCK_ID_AIR ||
-                    GetBlockGlobal(round(headCheck.x), round(headCheck.y), round(headCheck.z + playerWidthHalf)) != BLOCK_ID_AIR) {
-                    newPos.z = camera.Position.z; // Zablokuj ruch Z
+                if (isSolid(round(feetCheck.x), round(feetCheck.y), round(feetCheck.z + playerWidthHalf)) ||
+                    isSolid(round(headCheck.x), round(headCheck.y), round(headCheck.z + playerWidthHalf))) {
+                    newPos.z = camera.Position.z;
                 }
             } else if (playerVelocity.z < 0) { // Idziemy do tyłu (-Z)
-                if (GetBlockGlobal(round(feetCheck.x), round(feetCheck.y), round(feetCheck.z - playerWidthHalf)) != BLOCK_ID_AIR ||
-                    GetBlockGlobal(round(headCheck.x), round(headCheck.y), round(headCheck.z - playerWidthHalf)) != BLOCK_ID_AIR) {
-                    newPos.z = camera.Position.z; // Zablokuj ruch Z
+                if (isSolid(round(feetCheck.x), round(feetCheck.y), round(feetCheck.z - playerWidthHalf)) ||
+                    isSolid(round(headCheck.x), round(headCheck.y), round(headCheck.z - playerWidthHalf))) {
+                    newPos.z = camera.Position.z;
                 }
             }
 
-            // 6. Ostatecznie zaktualizuj pozycję kamery (stóp)
+            // 5. Ostatecznie zaktualizuj pozycję kamery
             camera.Position = newPos;
         }
         // --- KONIEC FIZYKI ---
@@ -742,32 +890,94 @@ int main()
 
        // Ustaw matrycę ortograficzn
        uiShader.setMat4("projection", ortho_projection);
+       uiShader.setFloat("u_opacity", 1.0f);
+       // Używamy naszego "pędzla" (unit quad)
+        glBindVertexArray(hotbarVAO);
 
-       // 1. Rysuj Tła Slotów (9 Slotów)
-       glBindVertexArray(hotbarVAO);
-       glActiveTexture(GL_TEXTURE0);
-       glBindTexture(GL_TEXTURE_2D, slotTextureID); // Tekstura slotu
-       uiShader.setInt("uiTexture", 0);
-       glDrawArrays(GL_TRIANGLES, 0, HOTBAR_SIZE * 6);
+        // --- 1. Rysuj 9 Slotów Tła ---
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, slotTextureID);
+        uiShader.setInt("uiTexture", 0);
 
-       // 2. Rysuj Ikony Bloków
-       glActiveTexture(GL_TEXTURE0);
-       glBindTexture(GL_TEXTURE_2D, iconsTextureID); // Tekstura ikon
-       int icon_offset_vertices = HOTBAR_SIZE * 6; // Przesunięcie do sekcji ikon w VBO
-       glDrawArrays(GL_TRIANGLES, icon_offset_vertices, HOTBAR_SIZE * 6);
+        // Resetuj UV (ważne)
+        uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+        uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
 
-       // 3. Rysuj Selekter (Ramka podświetlenia)
-       glActiveTexture(GL_TEXTURE0);
-       glBindTexture(GL_TEXTURE_2D, selectorTextureID); // Tekstura selektora
+        for (int i = 0; i < HOTBAR_SIZE; i++) {
+            float x_pos = BAR_START_X + i * (SLOT_SIZE + GAP);
+            float y_pos = 10.0f; // 10px od dołu
 
-       // Oblicz, od którego wierzchołka zacząć rysować aktywny selektor (6 wierzchołków na slot)
-       int selector_render_offset = g_activeSlot * 6;
-       glDrawArrays(GL_TRIANGLES, selector_render_offset, 6); // Rysuj jeden kwadrat (ramka)
+            glm::mat4 model = glm::mat4(1.0f);
+            model = glm::translate(model, glm::vec3(x_pos, y_pos, 0.0f));
+            model = glm::scale(model, glm::vec3(SLOT_SIZE, SLOT_SIZE, 1.0f));
+            uiShader.setMat4("model", model);
 
-       glBindVertexArray(0);
-       glEnable(GL_DEPTH_TEST);
-       glEnable(GL_CULL_FACE);
-       glDepthMask(GL_TRUE);
+            glDrawArrays(GL_TRIANGLES, 0, 6); // Rysuj kwadrat
+        }
+
+        // --- 2. Rysuj 9 Ikon Bloków ---
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, iconsTextureID);
+        uiShader.setInt("uiTexture", 0);
+
+        float ICON_SIZE = 52.0f; // Ikony są mniejsze (52x52)
+
+        // Obliczamy skalę UV (jak mały jest jeden kafelek ikony)
+        glm::vec2 uvScale(1.0f / ICON_ATLAS_COLS, 1.0f / ICON_ATLAS_ROWS);
+        uiShader.setVec2("u_uvScale", uvScale);
+
+        for (int i = 0; i < HOTBAR_SIZE; i++) {
+            // Pozycja ikony (wyśrodkowana w slocie)
+            float x_pos = BAR_START_X + i * (SLOT_SIZE + GAP) + (SLOT_SIZE - ICON_SIZE) / 2.0f;
+            float y_pos = 10.0f + (SLOT_SIZE - ICON_SIZE) / 2.0f;
+
+            glm::mat4 model = glm::mat4(1.0f);
+            model = glm::translate(model, glm::vec3(x_pos, y_pos, 0.0f));
+            model = glm::scale(model, glm::vec3(ICON_SIZE, ICON_SIZE, 1.0f));
+            uiShader.setMat4("model", model);
+
+            // --- Logika wyboru ikony ---
+            uint8_t blockID = g_hotbarSlots[i];
+
+            float iconIndex = 0.0f;
+            if (blockID == BLOCK_ID_GRASS) iconIndex = 0.0f;
+            else if (blockID == BLOCK_ID_DIRT) iconIndex = 1.0f;
+            else if (blockID == BLOCK_ID_STONE) iconIndex = 2.0f;
+            else if (blockID == BLOCK_ID_WATER) iconIndex = 3.0f;
+            // (Tu zmapuj resztę slotów 4-8, na razie będą się powtarzać)
+
+            // Przesuwamy UV do odpowiedniej ikony
+            glm::vec2 uvOffset(iconIndex / ICON_ATLAS_COLS, 0.0f);
+            uiShader.setVec2("u_uvOffset", uvOffset);
+
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+        }
+
+        // --- 3. Rysuj Selekter (Ramka podświetlenia) ---
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, selectorTextureID);
+        uiShader.setInt("uiTexture", 0);
+
+        // Resetuj UV (bardzo ważne!)
+        uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+        uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+
+        // Pozycja selektora (wyśrodkowana na slocie)
+        float selector_x_pos = BAR_START_X + g_activeSlot * (SLOT_SIZE + GAP) - (SELECTOR_SIZE - SLOT_SIZE) / 2.0f;
+        float selector_y_pos = 10.0f - (SELECTOR_SIZE - SLOT_SIZE) / 2.0f;
+
+        glm::mat4 model = glm::mat4(1.0f);
+        model = glm::translate(model, glm::vec3(selector_x_pos, selector_y_pos, 0.0f));
+        model = glm::scale(model, glm::vec3(SELECTOR_SIZE, SELECTOR_SIZE, 1.0f));
+        uiShader.setMat4("model", model);
+
+        glDrawArrays(GL_TRIANGLES, 0, 6); // Rysuj JEDEN kwadrat
+
+        // Koniec
+        glBindVertexArray(0);
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+        glDepthMask(GL_TRUE);
         // --- 5. SWAP BUFFERS ---
         glfwSwapBuffers(window);
         glfwPollEvents();
@@ -776,6 +986,13 @@ int main()
     // --- 6. Sprzątanie ---
     // Destruktory chunków (`~Chunk()`) zostaną wywołane automatycznie
     // gdy wektor 'chunks' wyjdzie poza zakres.
+    std::cout << "Zapisywanie swiata..." << std::endl;
+    for (auto& chunk : chunk_storage) // Użyj chunk_storage, a nie g_WorldChunks
+    {
+        chunk.SaveToFile();
+    }
+    std::cout << "Zapisano." << std::endl;
+    // --- KONIEC NOWOŚCI ---
     glDeleteProgram(ourShader.ID);
     glDeleteProgram(crosshairShader.ID); // <<< NOWOŚĆ
     glDeleteVertexArrays(1, &crosshairVAO); // <<< NOWOŚĆ
@@ -789,15 +1006,15 @@ int main()
 void processInput(GLFWwindow *window)
 {
     static bool f_pressed = false;
-    // --- NOWOŚĆ: Obsługa klawiszy numerycznych ---
+    // ... (obsługa klawiszy numerycznych Hotbara bez zmian) ...
     for (int i = 0; i < HOTBAR_SIZE; i++) {
-        // GLFW_KEY_1 jest 49, GLFW_KEY_2 jest 50, itd.
         if (glfwGetKey(window, GLFW_KEY_1 + i) == GLFW_PRESS) {
             g_activeSlot = i;
             g_selectedBlockID = g_hotbarSlots[i];
             break;
         }
     }
+
     // Zamknięcie okna
     if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
         glfwSetWindowShouldClose(window, true);
@@ -807,7 +1024,7 @@ void processInput(GLFWwindow *window)
         if (!f_pressed) {
             camera.ToggleFlyingMode();
             std::cout << "Tryb latania: " << (camera.flyingMode ? "ON" : "OFF") << std::endl;
-            if (!camera.flyingMode) playerVelocity = glm::vec3(0.0f); // Resetuj prędkość
+            if (!camera.flyingMode) playerVelocity = glm::vec3(0.0f);
         }
         f_pressed = true;
     }
@@ -816,38 +1033,37 @@ void processInput(GLFWwindow *window)
     }
 
     // --- Ustawianie "Życzenia" Ruchu (wishDir) ---
-    wishDir = glm::vec3(0.0f); // Resetuj w każdej klatce
+    wishDir = glm::vec3(0.0f);
 
+    // --- Ruch Poziomy (zawsze taki sam) ---
+    glm::vec3 front_horizontal = glm::normalize(glm::vec3(camera.Front.x, 0.0f, camera.Front.z));
+    glm::vec3 right_horizontal = glm::normalize(glm::vec3(camera.Right.x, 0.0f, camera.Right.z));
+    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) wishDir += front_horizontal;
+    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) wishDir -= front_horizontal;
+    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) wishDir -= right_horizontal;
+    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) wishDir += right_horizontal;
+
+    // --- Ruch Pionowy (zależy od trybu) ---
     if (camera.flyingMode)
     {
-        // --- Tryb Latania ---
-        if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) wishDir += camera.Front;
-        if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) wishDir -= camera.Front;
-        if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) wishDir -= camera.Right;
-        if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) wishDir += camera.Right;
         if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) wishDir += camera.WorldUp;
         if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) wishDir -= camera.WorldUp;
     }
-    else
+    else // Chodzenie lub Pływanie
     {
-        // --- Tryb Chodzenia (tylko XZ) ---
-        glm::vec3 front_horizontal = glm::normalize(glm::vec3(camera.Front.x, 0.0f, camera.Front.z));
-        glm::vec3 right_horizontal = glm::normalize(glm::vec3(camera.Right.x, 0.0f, camera.Right.z));
-
-        if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) wishDir += front_horizontal;
-        if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) wishDir -= front_horizontal;
-        if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) wishDir -= right_horizontal;
-        if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) wishDir += right_horizontal;
-
-        // Skok
+        // Skok (lub pływanie w górę)
         if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) {
             wishJump = true;
         } else {
             wishJump = false;
         }
+
+        // POPRAWKA: Pływanie w dół (lub kucanie, gdy je dodamy)
+        if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) {
+             wishDir -= camera.WorldUp; // Dodaj składową 'w dół'
+        }
     }
 
-    // Normalizuj wektor "życzenia" (jeśli nie jest zerowy), aby ruch po przekątnej nie był szybszy
     if (glm::length(wishDir) > 0.1f) {
         wishDir = glm::normalize(wishDir);
     }
@@ -877,9 +1093,8 @@ void mouse_callback(GLFWwindow* window, double xposIn, double yposIn)
 // Wypełnia 'out_prevBlock' (blok powietrza tuż przed trafieniem)
 bool Raycast(glm::vec3 startPos, glm::vec3 direction, float maxDist, glm::ivec3& out_hitBlock, glm::ivec3& out_prevBlock) {
     glm::vec3 currentPos = startPos;
-    float step = 0.05f; // Krok co 5cm
+    float step = 0.05f;
 
-    // Używamy round() do znalezienia bloku, w którym jest kamera
     glm::ivec3 prevBlockPos = glm::ivec3(
         static_cast<int>(round(startPos.x)),
         static_cast<int>(round(startPos.y)),
@@ -888,16 +1103,15 @@ bool Raycast(glm::vec3 startPos, glm::vec3 direction, float maxDist, glm::ivec3&
 
     for (float t = 0.0f; t < maxDist; t += step) {
         currentPos = startPos + direction * t;
-
-        // POPRAWKA: Używamy round() zamiast floor()
         glm::ivec3 blockPos = glm::ivec3(
             static_cast<int>(round(currentPos.x)),
             static_cast<int>(round(currentPos.y)),
             static_cast<int>(round(currentPos.z))
         );
 
-        // Sprawdź, czy ten blok jest solidny
-        if (GetBlockGlobal(blockPos.x, blockPos.y, blockPos.z) != BLOCK_ID_AIR) {
+        // POPRAWKA: Sprawdź, czy blok jest SOLIDNY
+        uint8_t block = GetBlockGlobal(blockPos.x, blockPos.y, blockPos.z);
+        if (block != BLOCK_ID_AIR && block != BLOCK_ID_WATER) {
             out_hitBlock = blockPos;
             out_prevBlock = prevBlockPos;
             return true;
@@ -905,29 +1119,46 @@ bool Raycast(glm::vec3 startPos, glm::vec3 direction, float maxDist, glm::ivec3&
 
         prevBlockPos = blockPos;
     }
-    return false; // Nic nie trafiono
+    return false;
 }
 
 
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 {
-    if (g_raycastHit && action == GLFW_PRESS) // Sprawdź, czy trafiliśmy i czy przycisk jest wciśnięty
+    // POPRAWKA: Musimy użyć nowej pozycji oczu
+    glm::vec3 eyePos = camera.Position + glm::vec3(0.0f, PLAYER_EYE_HEIGHT, 0.0f);
+
+    // Zmienne lokalne zamiast globalnych
+    glm::ivec3 hitBlockPos;
+    glm::ivec3 prevBlockPos;
+    float raycastDistance = 5.0f;
+
+    bool hit = Raycast(eyePos, camera.Front, raycastDistance, hitBlockPos, prevBlockPos);
+    g_raycastHit = hit; // Zapisz globalnie dla highlightera
+
+    if (hit && action == GLFW_PRESS)
     {
         if (button == GLFW_MOUSE_BUTTON_LEFT)
         {
-            // --- NISZCZENIE (Lewy Przycisk) ---
-            std::cout << "Niszczenie bloku w: "
-                      << g_hitBlockPos.x << ", " << g_hitBlockPos.y << ", " << g_hitBlockPos.z << std::endl;
-
-            SetBlock(g_hitBlockPos.x, g_hitBlockPos.y, g_hitBlockPos.z, BLOCK_ID_AIR);
+            // --- NISZCZENIE ---
+            uint8_t blockToDestroy = GetBlockGlobal(hitBlockPos.x, hitBlockPos.y, hitBlockPos.z);
+            if (blockToDestroy != BLOCK_ID_BEDROCK && blockToDestroy != BLOCK_ID_AIR && blockToDestroy != BLOCK_ID_WATER)
+            {
+                SetBlock(hitBlockPos.x, hitBlockPos.y, hitBlockPos.z, BLOCK_ID_AIR);
+            }
         }
         else if (button == GLFW_MOUSE_BUTTON_RIGHT)
         {
-            // --- BUDOWANIE (Prawy Przycisk) ---
-            std::cout << "Budowanie bloku w: "
-                      << g_prevBlockPos.x << ", " << g_prevBlockPos.y << ", " << g_prevBlockPos.z << std::endl;
+            // --- BUDOWANIE ---
 
-            SetBlock(g_prevBlockPos.x, g_prevBlockPos.y, g_prevBlockPos.z, g_selectedBlockID);
+            // POPRAWKA: Sprawdź, czy można budować w tym miejscu
+            uint8_t blockToPlaceIn = GetBlockGlobal(prevBlockPos.x, prevBlockPos.y, prevBlockPos.z);
+
+            // Możemy budować tylko w powietrzu lub zastępować wodę (jeśli nie trzymamy wody)
+            if (blockToPlaceIn == BLOCK_ID_AIR || (blockToPlaceIn == BLOCK_ID_WATER && g_selectedBlockID != BLOCK_ID_WATER))
+            {
+                SetBlock(prevBlockPos.x, prevBlockPos.y, prevBlockPos.z, g_selectedBlockID);
+            }
         }
     }
 }
