@@ -95,6 +95,18 @@ set(ASSET_FILES
         ${PROJECT_SOURCE_DIR}/button_back.png
         ${PROJECT_SOURCE_DIR}/button_start.png
         ${PROJECT_SOURCE_DIR}/font.png
+        ${PROJECT_SOURCE_DIR}/button_save_menu.png
+        ${PROJECT_SOURCE_DIR}/button_resume.png
+        ${PROJECT_SOURCE_DIR}/overlay.png
+        ${PROJECT_SOURCE_DIR}/sun.png
+        ${PROJECT_SOURCE_DIR}/depth.frag
+        ${PROJECT_SOURCE_DIR}/depth.vert
+        ${PROJECT_SOURCE_DIR}/break.mp3
+        ${PROJECT_SOURCE_DIR}/step.mp3
+        ${PROJECT_SOURCE_DIR}/place.mp3
+        ${PROJECT_SOURCE_DIR}/pop.mp3
+        ${PROJECT_SOURCE_DIR}/clouds.frag
+        ${PROJECT_SOURCE_DIR}/clouds.vert
 )
 
 # Kopiuj te pliki do folderu docelowego (gdzie jest .exe)

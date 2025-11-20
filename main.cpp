@@ -1,3 +1,5 @@
+#define MINIAUDIO_IMPLEMENTATION
+#include "miniaudio.h"
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 #include <iostream>
@@ -26,12 +28,18 @@
 enum GameState {
     STATE_MAIN_MENU,
     STATE_NEW_WORLD_MENU,
+    STATE_LOAD_WORLD_MENU,
     STATE_LOADING_WORLD,
+    STATE_PAUSE_MENU,
     STATE_IN_GAME,
-    STATE_EXITING
+    STATE_EXITING,
+    STATE_INVENTORY
 };
 GameState g_currentState = STATE_MAIN_MENU;
-
+bool IsAnyWater(uint8_t id) {
+    // 4 = Źródło, 13-16 = Płynąca (zgodnie z Chunk.h)
+    return id == BLOCK_ID_WATER || (id >= 13 && id <= 16);
+}
 // Prototypy funkcji
 void framebuffer_size_callback(GLFWwindow* window, int width, int height);
 void processInput(GLFWwindow *window);
@@ -43,11 +51,134 @@ bool IsMouseOver(double mouseX, double mouseY, float x, float y, float w, float 
 void DrawMenuButton(Shader& uiShader, unsigned int vao, unsigned int textureID, float x, float y, float w, float h);
 void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods);
 void char_callback(GLFWwindow* window, unsigned int codepoint);
-void RenderText(Shader& shader, unsigned int vao, const std::string& text,
-                float x, float y, float size);
+void RenderText(Shader& shader, unsigned int vao, const std::string& text,float x, float y, float size);
+void SaveWorld();
+void UpdateScreenSize(int width, int height);
+int GetSlotUnderMouse(double mouseX, double mouseY);
+void SpawnDrop(uint8_t itemID, glm::vec3 pos, glm::vec3 velocity);
+void UpdateDrops(float dt, glm::vec3 playerPos);
+void UpdateParticles(float dt);
+void SpawnBlockParticles(uint8_t blockID, glm::vec3 blockPos);
+void UpdateMining(float dt);
+void LoadInventory();
+void SaveInventory();
+void UpdateLiquids(float dt);
+void LoadPlayerPosition();
+void SavePlayerPosition();
+void SpawnEntity(glm::vec3 pos);
+void UpdateEntities(float dt);
+void CheckCrafting();
+bool AddItemToInventory(uint8_t itemID, int count);
+void DrawDurabilityBar(Shader& uiShader, unsigned int vao, float x, float y, float w, float h, int cur, int max);
+void UpdateSurvival(float dt);
+void InitClouds();
+
+const int INVENTORY_SLOTS = 36; // 9 slotów hotbara + 27 slotów plecaka
+const int MAX_STACK_SIZE = 64;
+
+struct ItemStack {
+    uint8_t itemID = BLOCK_ID_AIR;
+    int count = 0;
+    int durability = 0;    // Ile użyć zostało
+    int maxDurability = 0; // Maksymalna wytrzymałość (0 = niezniszczalny blok)
+};
+
+// Globalny ekwipunek (hotbar to pierwsze 9 slotów)
+std::vector<ItemStack> g_inventory(INVENTORY_SLOTS);
+std::vector<ItemStack> g_craftingGrid(4);
+// Slot wyjściowy (wynik)
+ItemStack g_craftingOutput = {BLOCK_ID_AIR, 0};
+const uint8_t ITEM_ID_PICKAXE = 20; // Nowe ID dla Kilofa
+// Specjalne indeksy slotów (żeby funkcja myszki wiedziała w co klikamy)
+const int SLOT_CRAFT_START = 100; // 100, 101, 102, 103
+const int SLOT_RESULT = 104;
+float playerHealth = 10.0f; // 10 serduszek (20 HP)
+float playerMaxHealth = 10.0f;
+float airTimer = 10.0f;     // Czas powietrza pod wodą (sekundy)
+bool isDead = false;
+unsigned int cloudTexture;
+unsigned int cloudVAO, cloudVBO;
+// Do obrażeń od upadku
+float lastYVelocity = 0.0f;
+ItemStack g_mouseItem = {BLOCK_ID_AIR, 0};
+struct Entity {
+    glm::vec3 position;
+    glm::vec3 velocity;
+    float rotationY;    // Obrót w osi Y (gdzie patrzy)
+    float moveTimer;    // Czas do zmiany decyzji (iść/stać)
+    bool isWalking;     // Czy teraz idzie?
+    float health;       // Życie (opcjonalnie)
+
+    // Kolor (dla uproszczenia użyjemy koloru zamiast tekstury na start)
+    glm::vec3 color;
+};
+void DrawPig(Shader& shader, const Entity& e, unsigned int vao);
+std::list<Entity> g_entities; // Lista wszystkich mobów
+struct DroppedItem {
+    uint8_t itemID;
+    glm::vec3 position;
+    glm::vec3 velocity;
+    float rotationTime; // Do obracania się
+    float pickupDelay;  // Żeby nie podnieść od razu po wyrzuceniu
+    bool isAlive;       // Czy przedmiot istnieje
+};
+
+std::list<DroppedItem> g_droppedItems;
+struct Particle {
+    glm::vec3 position;
+    glm::vec3 velocity;
+    uint8_t blockID;    // Żeby wiedzieć jaką teksturę nałożyć
+    float lifetime;     // Ile czasu jeszcze pożyje
+    float maxLifetime;  // Żeby obliczyć skalę (zanikanie)
+};
+
+std::list<Particle> g_particles;
+bool g_isMining = false;          // Czy gracz trzyma LPM?
+float g_miningTimer = 0.0f;       // Jak długo kopiemy ten blok
+glm::ivec3 g_currentMiningPos;    // Który blok aktualnie kopiemy
+// --- KONIEC NOWOŚCI ---
+ma_engine g_audioEngine;
+float g_footstepTimer = 0.0f;
+// --- NOWOŚĆ: Funkcja Twardości (Czas w sekundach) ---
+float GetBlockHardness(uint8_t blockID, uint8_t toolID) {
+    // 1. BAZOWE CZASY (Ręką)
+    float time = 1.0f; // Domyślnie
+
+    if (blockID == BLOCK_ID_BEDROCK) return -1.0f;
+    if (blockID == BLOCK_ID_LEAVES) return 0.2f;
+    if (blockID == BLOCK_ID_TORCH) return 0.05f;
+    if (blockID == BLOCK_ID_SAND) return 0.6f;
+    if (blockID == BLOCK_ID_DIRT || blockID == BLOCK_ID_GRASS) return 0.7f;
+    if (blockID == BLOCK_ID_LOG) return 2.0f;
+
+    // Kamień i rudy są twarde bez narzędzia
+    if (blockID == BLOCK_ID_STONE ||
+        blockID == BLOCK_ID_COAL_ORE ||
+        blockID == BLOCK_ID_IRON_ORE ||
+        blockID == BLOCK_ID_GOLD_ORE ||
+        blockID == BLOCK_ID_DIAMOND_ORE)
+    {
+        return 5.0f; // Długi czas kopania ręką
+    }
+
+    // 2. BONUSY NARZĘDZI
+    if (toolID == ITEM_ID_PICKAXE) {
+        // Kilof przyspiesza kopanie kamienia, rud, pieców itp.
+        if (blockID == BLOCK_ID_STONE || blockID == BLOCK_ID_SANDSTONE) {
+            time /= 10.0f; // 10x szybciej (0.5s zamiast 5.0s)
+        }
+        // (Tu dodasz rudy później: Coal, Iron itp.)
+    }
+
+    // 3. (Opcjonalnie) Siekiera
+    // if (toolID == ITEM_ID_AXE && blockID == BLOCK_ID_LOG) time /= 5.0f;
+
+    return time;
+}
+unsigned int dropVAO = 0, dropVBO = 0;
 // Ustawienia
-const unsigned int SCR_WIDTH = 1280; // Zwiększmy trochę rozdzielczość
-const unsigned int SCR_HEIGHT = 720;
+unsigned int SCR_WIDTH;
+unsigned int SCR_HEIGHT;
 std::string g_selectedWorldName;
 int g_selectedWorldSeed;
 std::vector<std::string> existingWorlds;
@@ -56,14 +187,14 @@ int currentMenuPage = 0;
 // Tekstury przycisków
 unsigned int texBtnNew, texBtnLoad, texBtnQuit;
 
-// Stałe przycisków (muszą być globalne dla callbacka myszy)
-const float BTN_W = 300.0f;
-const float BTN_H = 60.0f;
-const float BTN_X = (SCR_WIDTH - BTN_W) / 2.0f;
-const float BTN_Y_NEW = SCR_HEIGHT / 2.0f + 70.0f;
-const float BTN_Y_LOAD = SCR_HEIGHT / 2.0f;
-const float BTN_Y_QUIT = SCR_HEIGHT / 2.0f - 70.0f;
-std::string g_inputWorldName = "NowySwiat";
+// Stałe przycisków (teraz jako zmienne)
+float BTN_W = 300.0f;
+float BTN_H = 60.0f;
+float BTN_X;
+float BTN_Y_NEW;
+float BTN_Y_LOAD;
+float BTN_Y_QUIT;
+std::string g_inputWorldName;
 std::string g_inputSeedString;
 int g_activeInput = 0; // 0 = Nazwa, 1 = Seed, -1 = Brak
 
@@ -72,33 +203,49 @@ unsigned int texBtnStart;
 unsigned int texBtnBack;
 unsigned int texInputBox; // Będziemy reużywać ui_slot.png
 unsigned int texFont;
+unsigned int texOverlay;
+unsigned int texSun;
 
-// Pozycje dla nowego menu (ustaw je jak chcesz)
-const float INPUT_W = 400.0f;
-const float INPUT_H = 50.0f;
-const float INPUT_X = (SCR_WIDTH - INPUT_W) / 2.0f;
-const float INPUT_NAME_Y = SCR_HEIGHT / 2.0f + 60.0f;
-const float INPUT_SEED_Y = SCR_HEIGHT / 2.0f;
+// Pozycje dla nowego menu (teraz jako zmienne)
+float INPUT_W = 400.0f;
+float INPUT_H = 50.0f;
+float INPUT_X;
+float INPUT_NAME_Y;
+float INPUT_SEED_Y;
 
-const float BTN_START_X = (SCR_WIDTH - BTN_W) / 2.0f;
-const float BTN_START_Y = SCR_HEIGHT / 2.0f - 70.0f;
-const float BTN_BACK_X = (SCR_WIDTH - BTN_W) / 2.0f;
-const float BTN_BACK_Y = SCR_HEIGHT / 2.0f - 140.0f;
+float BTN_START_X;
+float BTN_START_Y;
+float BTN_BACK_X;
+float BTN_BACK_Y;
 const float FONT_ATLAS_COLS = 16.0f;
 const float FONT_ATLAS_ROWS = 8.0f;
+const float LIST_ITEM_W = 400.0f;
+const float LIST_ITEM_H = 50.0f;
+float LIST_ITEM_X;
+float LIST_START_Y;
+float LIST_GAP = 60.0f;
+float LIST_BACK_BTN_Y = 50.0f;
+unsigned int texBtnResume;
+unsigned int texBtnSaveAndMenu;
+float g_waterTimer = 0.0f;
+// Pozycje dla menu pauzy (teraz jako zmienne)
+float PAUSE_BTN_Y_RESUME;
+float PAUSE_BTN_Y_MENU;
+float PAUSE_BTN_Y_QUIT;
 // Kamera (ustawiona wyżej, żeby widzieć świat)
 Camera camera(glm::vec3(8.0f, 40.0f, 8.0f));
-float lastX = SCR_WIDTH / 2.0f;
+float lastX; // <-- Usunięto inicjalizację
 // --- NOWOŚĆ: GLOBALNA MAPA ŚWIATA ---
 // Będziemy przechowywać wskaźniki do chunków w tej mapie.
 // Kluczem jest pozycja chunka (np. 0,0 lub 1,0).
 class Chunk; // Forward-declaration
 std::map<glm::ivec2, Chunk*, CompareIveco2> g_WorldChunks;
 std::list<Chunk> chunk_storage;
+std::list<glm::vec3> g_torchPositions;
 // ... (zaraz po 'std::list<Chunk> chunk_storage;') s...
 //jdhsakhdkjas
 // --- NOWOŚĆ: Funkcje Interakcji ze Światem ---
-
+glm::mat4 ortho_projection;
 // Funkcja pomocnicza do pobierania bloku z dowolnego miejsca
 uint8_t GetBlockGlobal(int x, int y, int z) {
     int chunkX = static_cast<int>(floor(static_cast<float>(x) / CHUNK_WIDTH));
@@ -133,7 +280,7 @@ void SetBlock(int x, int y, int z, uint8_t blockID) {
 
     // Ustaw blok
     chunk->blocks[localX][y][localZ] = blockID;
-
+    chunk->CalculateLighting();
     // Przebuduj ten chunk
     chunk->buildMesh();
 
@@ -258,11 +405,82 @@ unsigned int loadUITexture(const char* path)
     stbi_image_free(data);
     return 0;
 }
+void InitDropMesh() {
+    // Tworzymy prosty sześcian 1x1x1.
+    // POPRAWKA: Wszystkie ściany boczne mają teraz UV zorientowane pionowo (Y jest górą).
+    float vertices[] = {
+        // Pozycja (XYZ)      // UV       // Normalne
+
+        // Tył (-Z)
+         0.5f, -0.5f, -0.5f,  0.0f, 0.0f,  0.0f,  0.0f, -1.0f,1.0f, // Dół-Lewo
+        -0.5f, -0.5f, -0.5f,  1.0f, 0.0f,  0.0f,  0.0f, -1.0f,1.0f,// Dół-Prawo
+        -0.5f,  0.5f, -0.5f,  1.0f, 1.0f,  0.0f,  0.0f, -1.0f,1.0f, // Góra-Prawo
+         0.5f,  0.5f, -0.5f,  0.0f, 1.0f,  0.0f,  0.0f, -1.0f,1.0f, // Góra-Lewo
+         0.5f, -0.5f, -0.5f,  0.0f, 0.0f,  0.0f,  0.0f, -1.0f,1.0f,
+        -0.5f,  0.5f, -0.5f,  1.0f, 1.0f,  0.0f,  0.0f, -1.0f,1.0f,
+
+        // Przód (+Z)
+        -0.5f, -0.5f,  0.5f,  0.0f, 0.0f,  0.0f,  0.0f, 1.0f,1.0f, // Dół-Lewo
+         0.5f, -0.5f,  0.5f,  1.0f, 0.0f,  0.0f,  0.0f, 1.0f,1.0f, // Dół-Prawo
+         0.5f,  0.5f,  0.5f,  1.0f, 1.0f,  0.0f,  0.0f, 1.0f,1.0f, // Góra-Prawo
+        -0.5f,  0.5f,  0.5f,  0.0f, 1.0f,  0.0f,  0.0f, 1.0f,1.0f, // Góra-Lewo
+        -0.5f, -0.5f,  0.5f,  0.0f, 0.0f,  0.0f,  0.0f, 1.0f,1.0f,
+         0.5f,  0.5f,  0.5f,  1.0f, 1.0f,  0.0f,  0.0f, 1.0f,1.0f,
+
+        // Lewo (-X) - TU BYŁY PROBLEMY
+        -0.5f, -0.5f, -0.5f,  0.0f, 0.0f, -1.0f,  0.0f,  0.0f,1.0f, // Dół-Lewo (Tył)
+        -0.5f, -0.5f,  0.5f,  1.0f, 0.0f, -1.0f,  0.0f,  0.0f, 1.0f,// Dół-Prawo (Przód)
+        -0.5f,  0.5f,  0.5f,  1.0f, 1.0f, -1.0f,  0.0f,  0.0f,1.0f, // Góra-Prawo
+        -0.5f,  0.5f, -0.5f,  0.0f, 1.0f, -1.0f,  0.0f,  0.0f,1.0f, // Góra-Lewo
+        -0.5f, -0.5f, -0.5f,  0.0f, 0.0f, -1.0f,  0.0f,  0.0f,1.0f,
+        -0.5f,  0.5f,  0.5f,  1.0f, 1.0f, -1.0f,  0.0f,  0.0f,1.0f,
+
+        // Prawo (+X) - TU TEŻ
+         0.5f, -0.5f,  0.5f,  0.0f, 0.0f,  1.0f,  0.0f,  0.0f,1.0f, // Dół-Lewo (Przód)
+         0.5f, -0.5f, -0.5f,  1.0f, 0.0f,  1.0f,  0.0f,  0.0f,1.0f, // Dół-Prawo (Tył)
+         0.5f,  0.5f, -0.5f,  1.0f, 1.0f,  1.0f,  0.0f,  0.0f,1.0f, // Góra-Prawo
+         0.5f,  0.5f,  0.5f,  0.0f, 1.0f,  1.0f,  0.0f,  0.0f,1.0f, // Góra-Lewo
+         0.5f, -0.5f,  0.5f,  0.0f, 0.0f,  1.0f,  0.0f,  0.0f,1.0f,
+         0.5f,  0.5f, -0.5f,  1.0f, 1.0f,  1.0f,  0.0f,  0.0f,1.0f,
+
+        // Dół (-Y)
+        -0.5f, -0.5f, -0.5f,  0.0f, 1.0f,  0.0f, -1.0f,  0.0f,1.0f,
+         0.5f, -0.5f, -0.5f,  1.0f, 1.0f,  0.0f, -1.0f,  0.0f,1.0f,
+         0.5f, -0.5f,  0.5f,  1.0f, 0.0f,  0.0f, -1.0f,  0.0f,1.0f,
+        -0.5f, -0.5f,  0.5f,  0.0f, 0.0f,  0.0f, -1.0f,  0.0f,1.0f,
+        -0.5f, -0.5f, -0.5f,  0.0f, 1.0f,  0.0f, -1.0f,  0.0f,1.0f,
+         0.5f, -0.5f,  0.5f,  1.0f, 0.0f,  0.0f, -1.0f,  0.0f,1.0f,
+
+        // Góra (+Y)
+        -0.5f,  0.5f, -0.5f,  0.0f, 1.0f,  0.0f,  1.0f,  0.0f,1.0f,
+         0.5f,  0.5f,  0.5f,  1.0f, 0.0f,  0.0f,  1.0f,  0.0f,1.0f,
+         0.5f,  0.5f, -0.5f,  1.0f, 1.0f,  0.0f,  1.0f,  0.0f,1.0f,
+         0.5f,  0.5f,  0.5f,  1.0f, 0.0f,  0.0f,  1.0f,  0.0f,1.0f,
+        -0.5f,  0.5f, -0.5f,  0.0f, 1.0f,  0.0f,  1.0f,  0.0f,1.0f,
+        -0.5f,  0.5f,  0.5f,  0.0f, 0.0f,  0.0f,  1.0f,  0.0f,1.0f
+    };
+
+    glGenVertexArrays(1, &dropVAO);
+    glGenBuffers(1, &dropVBO);
+    glBindVertexArray(dropVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, dropVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+
+    GLsizei stride = 9 * sizeof(float);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, stride, (void*)(5 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, stride, (void*)(8 * sizeof(float)));
+        glEnableVertexAttribArray(3);
+}
+
 
 const int RENDER_DISTANCE = 12;
+const int MAX_POINT_LIGHTS = 8; // <<< DODAJ TĘ LINIĘ
 const glm::vec3 SKY_COLOR(0.5f, 0.8f, 1.0f);
-const std::string G_WORLD_NAME = "MojPierwszySwiat";
-const int G_WORLD_SEED = 12345; // Zmień tę liczbę, aby dostać inny świat
 // --- KONIEC NOWOŚCI ---
 float lastY = SCR_HEIGHT / 2.0f;
 bool firstMouse = true;
@@ -274,18 +492,6 @@ const int HOTBAR_SIZE = 9;
 const float BUOYANCY = 9.0f;    // Siła wyporu (trochę słabsza niż grawitacja)
 const float WATER_DRAG = 0.85f; // Spowolnienie w wodzie
 // Tablica ID bloków w pasku (indeks 0 to slot 1, itd.)
-const uint8_t g_hotbarSlots[HOTBAR_SIZE] = {
-    BLOCK_ID_GRASS,
-    BLOCK_ID_DIRT,
-    BLOCK_ID_STONE,
-    BLOCK_ID_WATER,
-    BLOCK_ID_BEDROCK,
-    BLOCK_ID_DIRT,
-    BLOCK_ID_STONE,
-    BLOCK_ID_WATER,
-    BLOCK_ID_GRASS
-};
-
 int g_activeSlot = 0; // Aktywny slot (0 do 8)
 uint8_t g_selectedBlockID = BLOCK_ID_GRASS;
 glm::vec3 playerVelocity(0.0f); // Prędkość gracza (dla grawitacji, skoku)
@@ -310,6 +516,9 @@ unsigned int selectorTextureID;  // ID dla ui_selector.png// Nowy shader
 // --- KONIEC NOWOŚCI ---
 unsigned int iconsTextureID;
 unsigned int loadingTextureID;
+unsigned int shadowMapFBO;
+unsigned int shadowMapTexture;
+const unsigned int SHADOW_WIDTH = 2048, SHADOW_HEIGHT = 2048; // Rozdzielczość mapy cienia
 bool g_raycastHit = false; // Czy raycast w ogóle w coś trafił?
 glm::ivec3 g_hitBlockPos; // Pozycja trafionego bloku
 glm::ivec3 g_prevBlockPos; // Pozycja "przed" trafieniem
@@ -317,8 +526,8 @@ const float SLOT_SIZE = 64.0f;
 const float SELECTOR_SIZE = 70.0f;
 const float GAP = 0.0f;
 const float BAR_WIDTH = (SLOT_SIZE * HOTBAR_SIZE) + (GAP * (HOTBAR_SIZE - 1));
-const float BAR_START_X = (SCR_WIDTH - BAR_WIDTH) / 2.0f; // Wyśrodkowanie paska
-const float ICON_ATLAS_COLS = 8.0f; // Ile jest ikonek w rzędzie w pliku ui_icons.png
+float BAR_START_X;
+const float ICON_ATLAS_COLS = 18.0f; // Ile jest ikonek w rzędzie w pliku ui_icons.png
 const float ICON_ATLAS_ROWS = 1.0f; // Ile jest rzędów
 int main()
 {
@@ -330,29 +539,48 @@ int main()
         -1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,
         -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f
     };
-    g_selectedBlockID = g_hotbarSlots[g_activeSlot];
-    std::string worldFolderPath = "worlds/" + G_WORLD_NAME;
-    if (!std::filesystem::exists("worlds")) {
-        std::filesystem::create_directory("worlds");
-    }
-    if (!std::filesystem::exists(worldFolderPath)) {
-        try {
-            std::filesystem::create_directory(worldFolderPath);
-            std::cout << "Utworzono folder swiata: '" << worldFolderPath << "'" << std::endl;
-        } catch (const std::filesystem::filesystem_error& e) {
-            std::cout << "Blad: Nie mozna utworzyc folderu swiata: " << e.what() << std::endl;
-        }
-    }
+    g_inventory[0] = {BLOCK_ID_GRASS, 64};
+    g_inventory[1] = {BLOCK_ID_DIRT, 64};
+    g_inventory[2] = {BLOCK_ID_STONE, 64};
+    g_inventory[3] = {BLOCK_ID_TORCH, 64};
+    g_inventory[4] = {BLOCK_ID_LOG, 64};
+    g_inventory[5] = {BLOCK_ID_LEAVES, 64};
+    g_inventory[6] = {BLOCK_ID_SAND, 64};
+    g_inventory[7] = {BLOCK_ID_WATER, 64};
+    g_inventory[8] = {BLOCK_ID_BEDROCK, 64};
+
+    g_selectedBlockID = g_inventory[g_activeSlot].itemID;
     // --- 1. Inicjalizacja ---
     glfwInit();
+    if (ma_engine_init(NULL, &g_audioEngine) != MA_SUCCESS) {
+        std::cout << "BLAD: Nie udalo sie zainicjowac silnika audio!" << std::endl;
+        return -1;
+    }
+    std::cout << "Inicjalizacja pelnego ekranu" << std::endl;
+    // --- NOWY KOD: Pobierz rozdzielczość monitora ---
+    GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+    const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+    std::cout <<"Rozdzielczosc: "<< mode->width << "x" << mode->height << std::endl;
+    // Ustaw GLFW, aby stworzyć okno pasujące do monitora
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-
-    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "Krok 8: Culling!", nullptr, nullptr);
-    if (window == nullptr) { /* ... błąd ... */ return -1; }
+    glfwWindowHint(GLFW_RED_BITS, mode->redBits);
+    glfwWindowHint(GLFW_GREEN_BITS, mode->greenBits);
+    glfwWindowHint(GLFW_BLUE_BITS, mode->blueBits);
+    glfwWindowHint(GLFW_REFRESH_RATE, mode->refreshRate);
+    std::cout << "Wywolanie pelnego ekranu" << std::endl;
+    // Wywołaj naszą funkcję, aby ustawić globalne zmienne
+    UpdateScreenSize(mode->width, mode->height);
+    std::cout << "Poprawnie wykonano UpdateScreenSize" << std::endl;
+    // Stwórz okno w trybie PEŁNOEKRANOWYM (przekazując 'monitor')
+    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "Crafters", monitor, nullptr);
+    if (window == nullptr) { std::cout << "Nie udalo sie utworzyc okna GLFW" << std::endl; return -1; }
 
     glfwMakeContextCurrent(window);
+    // --- KONIEC NOWEGO KODU ---
+
+    // glfwMakeContextCurrent(window);
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
     glfwSwapInterval(0); // Wyłącz V-Sync
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
@@ -367,6 +595,9 @@ int main()
         std::cout << "Błąd: Nie można zainicjować GLAD" << std::endl;
         return -1;
     }
+    InitDropMesh();
+    InitClouds();
+    Shader cloudShader("clouds.vert", "clouds.frag");
     // Włączanie debugowania komunikatów OpenGL
     #ifdef DEBUG
         glEnable(GL_DEBUG_OUTPUT);
@@ -416,6 +647,7 @@ int main()
     selectorTextureID = loadUITexture("ui_selector.png");
     iconsTextureID = loadUITexture("ui_icons.png");
     loadingTextureID = loadUITexture("loading.png");
+    texOverlay = loadUITexture("overlay.png");
     ourShader.use();
     ourShader.setInt("ourTexture", 0);
     Shader crosshairShader("crosshair.vert", "crosshair.frag");
@@ -543,17 +775,57 @@ int main()
     texBtnBack = loadUITexture("button_back.png");
     texInputBox = loadUITexture("ui_slot.png"); // Reużywamy starej tekstury
     texFont = loadUITexture("font.png");
+    texBtnResume = loadUITexture("button_resume.png");
+    texBtnSaveAndMenu = loadUITexture("button_save_menu.png");
+    texSun = loadUITexture("sun.png"); // <<< DODAJ TĘ LINIĘ
     // --- NOWOŚĆ: PĘTLA ŁADOWANIA I WYGASZANIA ---
-    glm::mat4 ortho_projection = glm::ortho(0.0f, (float)SCR_WIDTH, 0.0f, (float)SCR_HEIGHT);
+    // glm::mat4 ortho_projection = glm::ortho(0.0f, (float)SCR_WIDTH, 0.0f, (float)SCR_HEIGHT);
+    Shader depthShader("depth.vert", "depth.frag");
 
+    // 1. Stwórz Framebuffer
+    glGenFramebuffers(1, &shadowMapFBO);
+
+    // 2. Stwórz Teksturę Głębi (Mapę Cienia)
+    glGenTextures(1, &shadowMapTexture);
+    glBindTexture(GL_TEXTURE_2D, shadowMapTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, SHADOW_WIDTH, SHADOW_HEIGHT, 0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+    float borderColor[] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, borderColor); // Poza mapą jest jasno
+
+    // 3. Podłącz teksturę do FBO
+    glBindFramebuffer(GL_FRAMEBUFFER, shadowMapFBO);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, shadowMapTexture, 0);
+    glDrawBuffer(GL_NONE); // Nie potrzebujemy bufora koloru
+    glReadBuffer(GL_NONE); // Nie potrzebujemy bufora koloru
+
+    // Sprawdź, czy FBO się powiodło
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        std::cout << "BLAD KRYTYCZNY: Framebuffer (Mapa Cienia) nie jest kompletny!" << std::endl;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0); // Od-binduj
+
+    // Ustaw, której jednostki tekstury używa shader
+    ourShader.use();
+    ourShader.setInt("ourTexture", 0);
+    ourShader.setInt("shadowMap", 1); // Mapa cienia będzie na jednostce 1
+    // --- KONIEC INICJALIZACJI FBO ---
 
    while (g_currentState != STATE_EXITING)
 {
-    // Obliczanie deltaTime (wspólne dla wszystkich stanów)
-    // auto currentFrame = static_cast<float>(glfwGetTime());
-    // deltaTime = currentFrame - lastFrame;
-    // lastFrame = currentFrame;
+       auto currentFrame = static_cast<float>(glfwGetTime());
+       deltaTime = currentFrame - lastFrame;
+       lastFrame = currentFrame;
 
+       float physicsDelta = deltaTime;
+       if (physicsDelta > 0.05f) {
+           physicsDelta = 0.05f; // "Zwolnij czas" przy lagu
+       }
+       // Przetwarzanie inputu (wspólne dla wszystkich stanów)
+       processInput(window);
     switch (g_currentState)
     {
         case STATE_MAIN_MENU:
@@ -621,11 +893,17 @@ int main()
             float FONT_SIZE = 24.0f;
             float PADDING_X = 10.0f;
             float PADDING_Y = (INPUT_H - FONT_SIZE) / 2.0f; // Wyśrodkuj w pionie
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
             // Rysuj tekst
             RenderText(uiShader, hotbarVAO, name_to_render, INPUT_X + PADDING_X, INPUT_NAME_Y + PADDING_Y, FONT_SIZE);
             RenderText(uiShader, hotbarVAO, seed_to_render, INPUT_X + PADDING_X, INPUT_SEED_Y + PADDING_Y, FONT_SIZE);
+            glDisable(GL_BLEND);
 
+            // Resetuj UV (bardzo ważne po RenderText!)
+            uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+            uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
 
             // Rysuj przycisk Start
             DrawMenuButton(uiShader, hotbarVAO, texBtnStart, BTN_START_X, BTN_START_Y, BTN_W, BTN_H);
@@ -633,7 +911,65 @@ int main()
             DrawMenuButton(uiShader, hotbarVAO, texBtnBack, BTN_BACK_X, BTN_BACK_Y, BTN_W, BTN_H);
             break;
         }
+        case STATE_LOAD_WORLD_MENU:
+        {
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+
+            glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+
+            uiShader.use();
+            uiShader.setMat4("projection", ortho_projection);
+            uiShader.setFloat("u_opacity", 1.0f);
+            uiShader.setInt("uiTexture", 0);
+
+            float FONT_SIZE = 24.0f;
+            float PADDING_X = 10.0f;
+
+            // --- Rysuj listę światów ---
+            float current_y = LIST_START_Y;
+            for (const std::string& worldName : existingWorlds)
+            {
+                // Rysuj tło przycisku
+                uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+                uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+                DrawMenuButton(uiShader, hotbarVAO, texInputBox, LIST_ITEM_X, current_y, LIST_ITEM_W, LIST_ITEM_H);
+
+                // Rysuj tekst (nazwę świata)
+                float PADDING_Y = (LIST_ITEM_H - FONT_SIZE) / 2.0f;
+                glEnable(GL_BLEND);
+                RenderText(uiShader, hotbarVAO, worldName, LIST_ITEM_X + PADDING_X, current_y + PADDING_Y, FONT_SIZE);
+                glDisable(GL_BLEND);
+
+                current_y -= LIST_GAP; // Przesuń w dół na następny przycisk
+            }
+
+            // --- Rysuj przycisk Wstecz ---
+            uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+            uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+            // Używamy stałych X i W z listy, ale Y z naszej nowej stałej
+            DrawMenuButton(uiShader, hotbarVAO, texBtnBack, LIST_ITEM_X, LIST_BACK_BTN_Y, LIST_ITEM_W, LIST_ITEM_H);
+
+            break;
+        }
         case STATE_LOADING_WORLD: {
+            std::string worldFolderPath = "worlds/" + g_selectedWorldName; // <-- WAŻNA ZMIANA
+            if (!std::filesystem::exists("worlds")) {
+                std::filesystem::create_directory("worlds");
+            }
+            if (!std::filesystem::exists(worldFolderPath)) {
+                try {
+                    std::filesystem::create_directory(worldFolderPath);
+                    std::cout << "Utworzono folder swiata: '" << worldFolderPath << "'" << std::endl;
+                } catch (const std::filesystem::filesystem_error& e) {
+                    std::cout << "Blad: Nie mozna utworzyc folderu swiata: " << e.what() << std::endl;
+                }
+            }
+            LoadInventory();
+            g_selectedBlockID = g_inventory[g_activeSlot].itemID;
+            LoadPlayerPosition();
         {
             // === ETAP 1: Pokaż statyczny obrazek ładowania ===
             glDisable(GL_DEPTH_TEST);
@@ -663,21 +999,54 @@ int main()
             // (Ten kod jest ukryty za ekranem ładowania)
             int playerChunkX = static_cast<int>(floor(camera.Position.x / CHUNK_WIDTH));
             int playerChunkZ = static_cast<int>(floor(camera.Position.z / CHUNK_DEPTH));
-            std::vector<Chunk*> chunksToBuild;
+
+            // Mierzymy czas, żeby nie przekroczyć limitu na klatkę
+            double loadingStartTime = glfwGetTime();
+            // Poświęcamy max 8ms na ładowanie (z 16ms dostępnych dla 60 FPS)
+            // Jeśli masz słabszy PC, zmniejsz to do 0.004 (4ms)
+            double timeBudget = 0.008;
+
+            bool somethingLoaded = false;
+
             for (int x = playerChunkX - RENDER_DISTANCE; x <= playerChunkX + RENDER_DISTANCE; x++) {
                 for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
+
+                    // SPRAWDZENIE CZASU: Czy przekroczyliśmy limit?
+                    // Robimy to na początku, ale po wykonaniu chociaż jednego pełnego obiegu pętli
+                    if (somethingLoaded && (glfwGetTime() - loadingStartTime > timeBudget)) {
+                        goto stop_loading; // Przerywamy natychmiast
+                    }
+
                     glm::ivec2 chunkPos(x, z);
-                    if (g_WorldChunks.find(chunkPos) == g_WorldChunks.end()) {
+
+                    // Jeśli chunk nie istnieje, stwórz go
+                    if (g_WorldChunks.find(chunkPos) == g_WorldChunks.end())
+                    {
                         chunk_storage.emplace_back(glm::vec3(x * CHUNK_WIDTH, 0.0f, z * CHUNK_DEPTH), g_selectedWorldName, g_selectedWorldSeed);
                         Chunk* newChunk = &chunk_storage.back();
                         g_WorldChunks[chunkPos] = newChunk;
-                        chunksToBuild.push_back(newChunk);
+
+                        // To jest najcięższa operacja:
+                        newChunk->buildMesh();
+                        newChunk->CalculateLighting();
+
+                        // Odśwież sąsiadów (to też jest ciężkie, ale konieczne dla wody/AO)
+                        auto refreshNeighbor = [&](int nx, int nz) {
+                            auto it = g_WorldChunks.find(glm::ivec2(nx, nz));
+                            if (it != g_WorldChunks.end()) {
+                                it->second->buildMesh();
+                            }
+                        };
+                        refreshNeighbor(x + 1, z);
+                        refreshNeighbor(x - 1, z);
+                        refreshNeighbor(x, z + 1);
+                        refreshNeighbor(x, z - 1);
+
+                        somethingLoaded = true; // Zaznacz, że coś zrobiliśmy w tej klatce
                     }
                 }
             }
-            for (Chunk* chunk : chunksToBuild) {
-                chunk->buildMesh();
-            }
+            stop_loading:;
         }
         std::cout << "Ladowanie zakonczone. Wygaszanie..." << std::endl;
 
@@ -790,9 +1159,13 @@ int main()
 
         case STATE_IN_GAME:
         {
-            auto currentFrame = static_cast<float>(glfwGetTime());
-        deltaTime = currentFrame - lastFrame;
-        lastFrame = currentFrame;
+
+            // Jeśli input zmienił stan (np. na STATE_PAUSE_MENU),
+            // natychmiast wyjdź, nie obliczaj fizyki
+            if (g_currentState != STATE_IN_GAME) {
+                break;
+            }
+            auto currentFrame = static_cast<float>(glfwGetTime()); // Ta linia jest OK
 
         // Licznik FPS
         frameCount++;
@@ -812,13 +1185,14 @@ int main()
         // --- Sprawdź, czy gracz jest w wodzie ---
         // Sprawdzamy blok na wysokości "oczu"
         glm::vec3 headPos = camera.Position + glm::vec3(0.0f, PLAYER_EYE_HEIGHT, 0.0f);
-        bool isInWater = (GetBlockGlobal(round(headPos.x), round(headPos.y), round(headPos.z)) == BLOCK_ID_WATER);
+            uint8_t headBlock = GetBlockGlobal(round(headPos.x), round(headPos.y), round(headPos.z));
+            bool isInWater = (headBlock == BLOCK_ID_WATER || (headBlock >= 13 && headBlock <= 16));
 
 
         if (camera.flyingMode)
         {
             // --- FIZYKA LATANIA (prosta) ---
-            camera.Position += wishDir * currentSpeed * deltaTime;
+            camera.Position += wishDir * currentSpeed * physicsDelta;
             onGround = false;
             playerVelocity = glm::vec3(0.0f);
         }
@@ -866,14 +1240,17 @@ int main()
             playerVelocity.z = wishDir.z * currentSpeed * speedMultiplier;
 
             // 3. Oblicz nową pozycję
-            glm::vec3 newPos = camera.Position + playerVelocity * deltaTime;
+            glm::vec3 newPos = camera.Position + playerVelocity * physicsDelta;
 
             // 4. Sprawdź kolizje (prosty AABB)
 
             // Funkcja pomocnicza sprawdzająca, czy blok jest SOLIDNY
             auto isSolid = [&](int x, int y, int z) {
                 uint8_t block = GetBlockGlobal(x, y, z);
-                return block != BLOCK_ID_AIR && block != BLOCK_ID_WATER;
+                return block != BLOCK_ID_AIR &&
+                   block != BLOCK_ID_WATER &&
+                       !(block == BLOCK_ID_WATER || (block >= 13 && block <= 16))&&
+                   block != BLOCK_ID_TORCH;
             };
 
             float playerWidthHalf = PLAYER_WIDTH / 2.0f;
@@ -925,75 +1302,340 @@ int main()
             camera.Position = newPos;
         }
         // --- KONIEC FIZYKI ---
-        processInput(window); // Obsługa WSAD i ESC
+        // processInput(window); // Obsługa WSAD i ESC
+        UpdateDrops(physicsDelta, camera.Position);
+            UpdateParticles(physicsDelta); // <<< DODAJ TĘ LINIĘ
+            UpdateMining(deltaTime);
+            UpdateLiquids(deltaTime);
+            UpdateEntities(physicsDelta);
+            UpdateSurvival(deltaTime);
+            bool isMoving = (glm::length(glm::vec2(playerVelocity.x, playerVelocity.z)) > 0.1f);
 
+            if (isMoving && onGround) {
+                // Szybkość kroków zależy od tego czy biegniemy (CTRL) czy idziemy
+                float stepDelay = (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS) ? 0.3f : 0.5f;
+
+                g_footstepTimer += deltaTime;
+
+                if (g_footstepTimer >= stepDelay) {
+                    // Odtwórz dźwięk (musisz mieć plik "step.mp3" lub "step.wav" w folderze projektu!)
+                    ma_engine_play_sound(&g_audioEngine, "step.mp3", NULL);
+
+                    // Zresetuj timer
+                    g_footstepTimer = 0.0f;
+
+                    // Efekt "Bobbing" kamery (opcjonalnie, jeśli jeszcze nie masz)
+                }
+            } else {
+                // Jeśli stoimy, zresetuj timer, żeby pierwszy krok po ruszeniu był szybki
+                g_footstepTimer = 0.5f;
+            }
         // --- 2. RAYCASTING (w każdej klatce) ---
         float raycastDistance = 5.0f;
         glm::vec3 eyePos = camera.Position + glm::vec3(0.0f, PLAYER_EYE_HEIGHT, 0.0f);
         g_raycastHit = Raycast(eyePos, camera.Front, raycastDistance, g_hitBlockPos, g_prevBlockPos);
 
         // --- 3. ŁADOWANIE CHUNKÓW (bez zmian) ---
-        int playerChunkX = static_cast<int>(floor(camera.Position.x / CHUNK_WIDTH));
-        int playerChunkZ = static_cast<int>(floor(camera.Position.z / CHUNK_DEPTH));
+            int playerChunkX = static_cast<int>(floor(camera.Position.x / CHUNK_WIDTH));
+            int playerChunkZ = static_cast<int>(floor(camera.Position.z / CHUNK_DEPTH));
 
-        std::vector<Chunk*> chunksToBuild;
-        for (int x = playerChunkX - RENDER_DISTANCE; x <= playerChunkX + RENDER_DISTANCE; x++) {
-            for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
-                glm::ivec2 chunkPos(x, z);
-                if (g_WorldChunks.find(chunkPos) == g_WorldChunks.end()) {
-                    chunk_storage.emplace_back(glm::vec3(x * CHUNK_WIDTH, 0.0f, z * CHUNK_DEPTH), g_selectedWorldName, g_selectedWorldSeed);
-                    Chunk* newChunk = &chunk_storage.back();
-                    g_WorldChunks[chunkPos] = newChunk;
-                    chunksToBuild.push_back(newChunk);
+            // Już nie potrzebujemy wektora 'chunksToBuild'
+            // std::vector<Chunk*> chunksToBuild;
+
+            for (int x = playerChunkX - RENDER_DISTANCE; x <= playerChunkX + RENDER_DISTANCE; x++) {
+                for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
+                    glm::ivec2 chunkPos(x, z);
+
+                    // Jeśli chunk nie istnieje...
+                    if (g_WorldChunks.find(chunkPos) == g_WorldChunks.end())
+                    {
+                        // 1. Stwórz go i zbuduj jego mesh
+                        chunk_storage.emplace_back(glm::vec3(x * CHUNK_WIDTH, 0.0f, z * CHUNK_DEPTH), g_selectedWorldName, g_selectedWorldSeed);
+                        Chunk* newChunk = &chunk_storage.back();
+                        g_WorldChunks[chunkPos] = newChunk;
+                        newChunk->buildMesh(); // Zbuduj mesh od razu
+                        newChunk->CalculateLighting();
+
+                        // 2. KLUCZOWY KROK: Powiedz istniejącym sąsiadom, żeby też się przebudowali
+                        auto findAndBuild = [&](int nX, int nZ) {
+                            auto it = g_WorldChunks.find(glm::ivec2(nX, nZ));
+                            if (it != g_WorldChunks.end()) {
+                                it->second->buildMesh();
+                            }
+                        };
+
+                        findAndBuild(x + 1, z); // Sąsiad +X
+                        findAndBuild(x - 1, z); // Sąsiad -X
+                        findAndBuild(x, z + 1); // Sąsiad +Z
+                        findAndBuild(x, z - 1); // Sąsiad -Z
+                    }
+                }
+            }
+        // for (Chunk* chunk : chunksToBuild) {
+        //     chunk->buildMesh();
+        // }
+
+        // --- 4. RENDEROWANIE ---
+      float dayDuration = 300.0f; // Pełen cykl (dzień + noc) trwa 60 sekund
+            float startTimeOffset = dayDuration * 0.3f;
+        float timeOfDay = fmod(glfwGetTime()+startTimeOffset, dayDuration) / dayDuration; // Wartość 0.0 do 1.0
+
+        // 1. Oblicz pozycję słońca (obraca się w kółko)
+        float sunAngle = timeOfDay * 2.0f * 3.14159f; // Pełen obrót (radiany)
+
+        // s.y = 1.0 (południe), s.y = -1.0 (północ), s.y = 0.0 (wschód/zachód)
+        // 'sunDirection' to wektor OD słońca
+        glm::vec3 sunDirection = glm::normalize(glm::vec3(sin(sunAngle), cos(sunAngle), 0.3f));
+
+        // 2. Oblicz współczynnik oświetlenia (0.0 = noc, 1.0 = dzień)
+        // Używamy .y (cos(sunAngle)), który jest > 0 tylko w dzień
+        float daylightFactor = std::clamp(-sunDirection.y, 0.0f, 1.0f);
+
+        // 3. Oblicz dynamiczne kolory
+        glm::vec3 daySkyColor = glm::vec3(0.5f, 0.8f, 1.0f);
+        glm::vec3 nightSkyColor = glm::vec3(0.02f, 0.02f, 0.08f); // Ciemny granat
+        glm::vec3 currentSkyColor = mix(nightSkyColor, daySkyColor, daylightFactor);
+
+        // 4. Oblicz dynamiczną intensywność Słońca
+        // W nocy (daylightFactor = 0), ambient jest słaby (księżyc), diffuse jest 0 (wyłączone).
+        glm::vec3 sunAmbient = mix(glm::vec3(0.05f), glm::vec3(0.3f), daylightFactor);
+        glm::vec3 sunDiffuse = mix(glm::vec3(0.0f), glm::vec3(0.7f), daylightFactor);
+        // --- KONIEC CYKLU DNIA/NOCY ---
+
+
+        // Użyj obliczonego koloru do czyszczenia tła
+        glClearColor(currentSkyColor.x, currentSkyColor.y, currentSkyColor.z, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        // --- NAJPIERW OBLICZ MACIERZE ---
+        float viewDistance = (RENDER_DISTANCE + 1) * CHUNK_WIDTH;
+        glm::mat4 projection = glm::perspective(glm::radians(camera.Zoom), (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, viewDistance);
+        glm::mat4 view = camera.GetViewMatrix();
+        // 'sunDirection' jest już obliczony dynamicznie
+
+        // --- PRZEBIEG 1: RENDEROWANIE MAPY CIENIA ---
+            {
+                float shadowRange = 180.0f;
+                glm::mat4 lightProjection = glm::ortho(-shadowRange, shadowRange, -shadowRange, shadowRange, 1.0f, 150.0f);
+                glm::vec3 lightCamPos = camera.Position - (sunDirection * 50.0f);
+                glm::mat4 lightView = glm::lookAt(lightCamPos, camera.Position, glm::vec3(0.0, 1.0, 0.0));
+                glm::mat4 lightSpaceMatrix = lightProjection * lightView;
+
+                depthShader.use();
+                depthShader.setMat4("lightSpaceMatrix", lightSpaceMatrix);
+
+                glViewport(0, 0, SHADOW_WIDTH, SHADOW_HEIGHT);
+                glBindFramebuffer(GL_FRAMEBUFFER, shadowMapFBO);
+                glClear(GL_DEPTH_BUFFER_BIT);
+
+                // --- KLUCZOWA POPRAWKA: ZMIANA CULLINGU ---
+                // Rysujemy TYLNE ściany do mapy cienia.
+                // To eliminuje "Shadow Acne" (paski) na oświetlonych powierzchniach.
+                glCullFace(GL_FRONT);
+                // ------------------------------------------
+
+                int pCX = static_cast<int>(floor(camera.Position.x / CHUNK_WIDTH));
+                int pCZ = static_cast<int>(floor(camera.Position.z / CHUNK_DEPTH));
+
+                for (int x = pCX - RENDER_DISTANCE; x <= pCX + RENDER_DISTANCE; x++) {
+                    for (int z = pCZ - RENDER_DISTANCE; z <= pCZ + RENDER_DISTANCE; z++) {
+                        auto it = g_WorldChunks.find(glm::ivec2(x, z));
+                        if (it != g_WorldChunks.end()) {
+                            // Rysujemy tylko solidne bloki do cienia (bez wody/liści dla wydajności)
+                            it->second->DrawSolid(depthShader, textureAtlas);
+                        }
+                    }
+                }
+
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+                // --- PRZYWRÓĆ NORMALNY CULLING ---
+                glCullFace(GL_BACK);
+                // ---------------------------------
+            }
+
+        // --- PRZEBIEG 2: NORMALNE RENDEROWANIE (Z PERSPEKTYWY GRACZA) ---
+        glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
+        // (glClear jest już wywołany na górze)
+
+        // --- PRZEBIEG 2A: SKYBOX ---
+        if (cubemapTexture != 0)
+        {
+            glDepthFunc(GL_LEQUAL);
+            skyboxShader.use();
+            skyboxShader.setMat4("projection", projection);
+            skyboxShader.setMat4("view", glm::mat4(glm::mat3(view))); // Usuń translację
+            glBindVertexArray(skyboxVAO);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_CUBE_MAP, cubemapTexture);
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+            glBindVertexArray(0);
+            glDepthFunc(GL_LESS);
+        }
+            {
+            // POPRAWKA: Słońce musi być względem KAMERY, a nie świata (0,0,0).
+            // Dzięki temu zawsze jest 50 metrów od naszej głowy.
+            glm::vec3 sunPos3D = camera.Position + (glm::normalize(-sunDirection) * 50.0f);
+
+            // Rzutujemy na ekran
+            glm::vec4 clipSpacePos = projection * view * glm::vec4(sunPos3D, 1.0);
+
+            // Sprawdź, czy słońce jest przed kamerą
+            if (clipSpacePos.w > 0.0)
+            {
+                glm::vec3 ndcPos = glm::vec3(clipSpacePos.x, clipSpacePos.y, clipSpacePos.z) / clipSpacePos.w;
+
+                // Rysuj słońce (bez sprawdzania Z <= 1.0, bo przyciągnęliśmy je blisko)
+                {
+                    float sunX = ((ndcPos.x + 1.0) / 2.0) * SCR_WIDTH;
+                    float sunY = ((ndcPos.y + 1.0) / 2.0) * SCR_HEIGHT;
+
+                    float sunSize = 100.0f;
+                    float drawX = sunX - (sunSize / 2.0);
+                    float drawY = sunY - (sunSize / 2.0);
+
+                    // --- Renderowanie ---
+                    glDisable(GL_DEPTH_TEST); // Ważne: Rysuj ZAWSZE na wierzchu skyboxa
+                    glDepthMask(GL_FALSE);    // Nie zapisuj głębi (żeby góry mogły je przykryć później)
+                    glDisable(GL_CULL_FACE);  // Widoczne z obu stron
+
+                    glEnable(GL_BLEND);
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE); // Tryb świecenia (Addytywny)
+
+                    uiShader.use();
+                    uiShader.setMat4("projection", ortho_projection);
+                    uiShader.setFloat("u_opacity", 1.0f);
+                    uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+                    uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+
+                    DrawMenuButton(uiShader, hotbarVAO, texSun, drawX, drawY, sunSize, sunSize);
+
+                    // --- Przywracanie stanów ---
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                    glEnable(GL_DEPTH_TEST);
+                    glDepthMask(GL_TRUE);
+                    glEnable(GL_CULL_FACE);
                 }
             }
         }
-        for (Chunk* chunk : chunksToBuild) {
-            chunk->buildMesh();
-        }
 
-        // --- 4. RENDEROWANIE ---
-        glClearColor(0.5f, 0.8f, 1.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            //rysowanie świnki
+            ourShader.use();
+            ourShader.setInt("u_useUVTransform", 1);
+            ourShader.setVec2("u_uvScale", 1.0f / ATLAS_COLS, 1.0f / ATLAS_ROWS);
 
-        // Ustaw widok i projekcję RAZ
-        ourShader.use();
-       float fogStart = (RENDER_DISTANCE - 2) * CHUNK_WIDTH; // Mgła zaczyna się 2 chunky od krawędzi
-       float fogEnd = (RENDER_DISTANCE + 1) * CHUNK_WIDTH;   // Mgła jest pełna na krawędzi
-       ourShader.setVec3("u_fogColor", SKY_COLOR);
-       ourShader.setFloat("u_fogStart", fogStart);
-       ourShader.setFloat("u_fogEnd", fogEnd);
-       float viewDistance = (RENDER_DISTANCE + 1) * CHUNK_WIDTH; // +1 dla bezpieczeństwa
-       glm::mat4 projection = glm::perspective(glm::radians(camera.Zoom), (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, viewDistance);
-       glm::mat4 view = camera.GetViewMatrix();
+            // Używamy dropVAO jako "cegiełki" do budowania świni
+            glBindVertexArray(dropVAO);
+
+            for (const auto& e : g_entities) {
+                // Wywołaj naszą nową funkcję rysującą
+                DrawPig(ourShader, e, dropVAO);
+            }
+
+            ourShader.setInt("u_useUVTransform", 0);
+            {
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDisable(GL_CULL_FACE); // Chmury widać z dołu
+
+                cloudShader.use();
+                cloudShader.setMat4("projection", projection);
+                cloudShader.setMat4("view", view);
+                cloudShader.setVec3("viewPos", camera.Position);
+
+                // Animacja wiatru
+                float speed = 0.01f;
+                float offset = (float)glfwGetTime() * speed;
+                cloudShader.setVec2("u_cloudOffset", glm::vec2(offset, 0.0f)); // Płyń w osi X
+
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, cloudTexture);
+
+                glBindVertexArray(cloudVAO);
+                glDrawArrays(GL_TRIANGLES, 0, 6);
+
+                glEnable(GL_CULL_FACE);
+            }
+            // --- PRZEBIEG 2B: ŚWIAT (SOLID) ---
+            ourShader.use();
+            ourShader.setInt("u_isWater", 0); // Domyślnie NIE faluj
+            ourShader.setFloat("u_time", (float)glfwGetTime()); // Prześlij czas
+
+        // Ustaw wszystkie uniformy (Macierze, Mgła, Światła)
         ourShader.setMat4("projection", projection);
         ourShader.setMat4("view", view);
-       if (cubemapTexture != 0)
-       {
-           // 1. Zmień stan głębi: GL_LEQUAL rysuje obiekty na krawędzi dalekiego planu
-           glDepthFunc(GL_LEQUAL);
+        ourShader.setVec3("viewPos", camera.Position);
 
-           // 2. Użyj shadera
-           skyboxShader.use();
-           skyboxShader.setMat4("projection", projection);
+            glm::vec3 finalFogColor = currentSkyColor;
+            float finalFogStart = (RENDER_DISTANCE - 2) * CHUNK_WIDTH;
+            float finalFogEnd = (RENDER_DISTANCE + 1) * CHUNK_WIDTH;
 
-           // Macierz widoku (View) bez translacji: Skybox podąża za kamerą
-           glm::mat4 viewNoTranslation = glm::mat4(glm::mat3(view));
-           skyboxShader.setMat4("view", viewNoTranslation);
+            // Sprawdź, czy kamera jest pod wodą
+            // (Oczy są na Position + 0.0, 1.6, 0.0, ale lepiej sprawdzić samą pozycję kamery)
+            glm::vec3 camEye = camera.Position;
 
-           // 3. Rysuj
-           glBindVertexArray(skyboxVAO);
-           glActiveTexture(GL_TEXTURE0);
-           glBindTexture(GL_TEXTURE_CUBE_MAP, cubemapTexture);
-           glDrawArrays(GL_TRIANGLES, 0, 36);
-           glBindVertexArray(0);
 
-           // 4. Przywróć stan głębi (KLUCZOWE)
-           glDepthFunc(GL_LESS);
-       }
+            // Czy głowa jest w bloku wody?
+            if (headBlock == BLOCK_ID_WATER || (headBlock >= 13 && headBlock <= 16)) {
+                // JESTEŚMY POD WODĄ!
+                finalFogColor = glm::vec3(0.0f, 0.1f, 0.4f); // Ciemny granat
+                finalFogStart = 0.0f;    // Mgła zaczyna się od razu przy oczach
+                finalFogEnd = 15.0f;     // Widoczność tylko na 15 metrów
+            }
+            ourShader.setVec3("u_fogColor", finalFogColor);
+            ourShader.setFloat("u_fogStart", finalFogStart);
+            ourShader.setFloat("u_fogEnd", finalFogEnd);
 
-       ourShader.use();
-        // PRZEBIEG 1: Solid
+        // Słońce (DirLight) (użyj dynamicznych wartości)
+        ourShader.setVec3("u_dirLight.direction", sunDirection); // <<< POPRAWKA (dynamiczny kierunek)
+        ourShader.setVec3("u_dirLight.ambient", sunAmbient); // <<< POPRAWKA
+        ourShader.setVec3("u_dirLight.diffuse", sunDiffuse); // <<< POPRAWKA
+        ourShader.setVec3("u_dirLight.specular", 0.5f, 0.5f, 0.5f);
+
+        // Pochodnia (PointLight) (bez zmian)
+            int lightCount = 0;
+            for (const auto& torchPos : g_torchPositions)
+            {
+                // Upewnij się, że nie przekraczamy limitu shadera
+                if (lightCount >= MAX_POINT_LIGHTS) break;
+                std::string base = "u_pointLights[" + std::to_string(lightCount) + "]";
+
+                ourShader.setVec3(base + ".position", torchPos);
+                ourShader.setVec3(base + ".ambient", 0.05f, 0.02f, 0.0f);
+
+                // --- EFEKT MIGOTANIA ---
+                // Używamy czasu i pozycji pochodni, żeby każda migała inaczej
+                // Mieszamy dwa sinusy, żeby ruch był bardziej "chaotyczny"
+                float flicker = sin(glfwGetTime() * 10.0f + torchPos.x) * 0.05f +
+                                cos(glfwGetTime() * 23.0f + torchPos.z) * 0.05f;
+
+                // Kolor ognia (Ciepły pomarańcz)
+                ourShader.setVec3(base + ".diffuse", 1.5f + flicker, 0.9f + flicker, 0.4f);
+                ourShader.setVec3(base + ".specular", 1.5f, 0.9f, 0.4f);
+
+                ourShader.setFloat(base + ".constant", 1.0f);
+                // Zmieniamy zasięg w rytm migotania
+                ourShader.setFloat(base + ".linear", 0.09f + flicker * 0.1f);
+                ourShader.setFloat(base + ".quadratic", 0.032f);
+
+                lightCount++;
+            }
+            ourShader.setInt("u_pointLightCount", lightCount);
+
+        // --- KLUCZOWE DLA CIENI ---
+        // (Musimy obliczyć 'lightSpaceMatrix' DOKŁADNIE TAK SAMO jak w Przebiegu 1)
+        float shadowRange = 180.0f; // Ta wartość MUSI być taka sama jak w Przebiegu 1
+        glm::mat4 lightProjection = glm::ortho(-shadowRange, shadowRange, -shadowRange, shadowRange, 1.0f, 150.0f);
+        glm::vec3 lightCamPos = camera.Position - (sunDirection * 50.0f); // Użyj DYNAMICZNEGO kierunku
+        glm::mat4 lightView = glm::lookAt(lightCamPos, camera.Position, glm::vec3(0.0, 1.0, 0.0));
+        glm::mat4 lightSpaceMatrix = lightProjection * lightView;
+        ourShader.setMat4("lightSpaceMatrix", lightSpaceMatrix);
+
+        // Powiedz shaderowi, żeby użył tekstury cienia na jednostce 1
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, shadowMapTexture);
+
+        // Rysuj bloki stałe (używając 'ourShader')
         glDepthMask(GL_TRUE);
         glEnable(GL_CULL_FACE);
         for (int x = playerChunkX - RENDER_DISTANCE; x <= playerChunkX + RENDER_DISTANCE; x++) {
@@ -1004,10 +1646,22 @@ int main()
                 }
             }
         }
+            ourShader.use(); // Upewnij się, że główny shader jest aktywny
+            glDepthMask(GL_TRUE); // <<< WAŻNE: Włącz pisanie do głębi
+            glDisable(GL_CULL_FACE); // Wyłącz culling dla pochodni
 
-        // PRZEBIEG 1.5: PODŚWIETLENIE
+            for (int x = playerChunkX - RENDER_DISTANCE; x <= playerChunkX + RENDER_DISTANCE; x++) {
+                for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
+                    auto it = g_WorldChunks.find(glm::ivec2(x, z));
+                    if (it != g_WorldChunks.end()) {
+                        it->second->DrawFoliage(ourShader, textureAtlas); // <<< Użyj nowej funkcji
+                    }
+                }
+            }
+        // --- PRZEBIEG 2C: PODŚWIETLENIE ---
         if (g_raycastHit)
         {
+            // ... (Twój kod podświetlenia - bez zmian) ...
             glDisable(GL_DEPTH_TEST);
             glDisable(GL_CULL_FACE);
 
@@ -1015,41 +1669,295 @@ int main()
             highlighterShader.setMat4("projection", projection);
             highlighterShader.setMat4("view", view);
 
-            // POPRAWKA: Prostsza transformacja
             glm::mat4 model = glm::mat4(1.0f);
-            // 1. Przesuń obwódkę (wyśrodkowaną na 0,0,0)
-            //    na pozycję bloku (wyśrodkowanego na (x,y,z))
             model = glm::translate(model, glm::vec3(g_hitBlockPos));
-            // 2. Lekko powiększ, aby uniknąć Z-fightingu
             model = glm::scale(model, glm::vec3(1.002f, 1.002f, 1.002f));
 
             highlighterShader.setMat4("model", model);
 
             glBindVertexArray(highlighterVAO);
-            glDrawArrays(GL_LINES, 0, 24); // Rysuj 24 wierzchołki (12 linii)
+            glDrawArrays(GL_LINES, 0, 24);
             glBindVertexArray(0);
 
             glEnable(GL_DEPTH_TEST);
             glEnable(GL_CULL_FACE);
         }
 
-        // PRZEBIEG 2: Transparent (Woda) - POPRAWIONY
-        ourShader.use();
-        glDepthMask(GL_FALSE);
-        for (int x = playerChunkX - RENDER_DISTANCE; x <= playerChunkX + RENDER_DISTANCE; x++) {
-            for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
-                // TUTAJ BYŁ BŁĄD - TERAZ JEST POPRAWNIE
-                auto it = g_WorldChunks.find(glm::ivec2(x, z));
-                if (it != g_WorldChunks.end()) {
-                    it->second->DrawTransparent(ourShader, textureAtlas);
+        // --- PRZEBIEG 2D: WODA (TRANSPARENT) ---
+            ourShader.use();
+            glDepthMask(GL_FALSE); // Nie pisz do bufora głębi
+            glEnable(GL_BLEND);    // Włącz blendowanie
+            glDisable(GL_CULL_FACE); // Rysuj obie strony (dla liści/pochodni)
+            ourShader.setInt("u_isWater", 1);
+            // --- NOWA LOGIKA SORTOWANIA ---
+            // Stwórz mapę, która posortuje chunki od NAJDALSZEGO do NAJBLIŻSZEGO
+            // Klucz: Dystans (float), Wartość: Wskaźnik na Chunk (Chunk*)
+            std::map<float, Chunk*, std::greater<float>> sortedChunks;
+
+            // 1. Wypełnij mapę wszystkimi widocznymi chunkami
+            for (int x = playerChunkX - RENDER_DISTANCE; x <= playerChunkX + RENDER_DISTANCE; x++) {
+                for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
+                    auto it = g_WorldChunks.find(glm::ivec2(x, z));
+                    if (it != g_WorldChunks.end()) {
+                        Chunk* chunk = it->second;
+
+                        // Oblicz kwadrat dystansu od kamery do środka chunka
+                        // (Nie musimy liczyć pierwiastka (sqrt), sam kwadrat wystarczy do sortowania)
+                        glm::vec3 chunkCenter = chunk->position + glm::vec3(CHUNK_WIDTH / 2.0f, CHUNK_HEIGHT / 2.0f, CHUNK_DEPTH / 2.0f);
+                        glm::vec3 vecToChunk = camera.Position - chunkCenter;
+                        float distanceSq = glm::dot(vecToChunk, vecToChunk); // Użyj iloczynu skalarnego
+
+                        // Dodaj do posortowanej mapy
+                        sortedChunks[distanceSq] = chunk;
+                    }
                 }
             }
+
+            // 2. Rysuj chunki w posortowanej kolejności (od tyłu do przodu)
+            // (std::map automatycznie sortuje klucze, a std::greater<float> odwraca kolejność)
+            for (auto const& [dist, chunk] : sortedChunks)
+            {
+                chunk->DrawTransparent(ourShader, textureAtlas);
+            }
+            // --- KONIEC NOWEJ LOGIKI ---
+            ourShader.setInt("u_isWater", 0);
+            glEnable(GL_CULL_FACE); // Włącz culling z powrotem
+            glDepthMask(GL_TRUE); // Włącz z powrotem pisanie do bufora głębi
+        // --- PRZEBIEG 3: UI (SŁOŃCE, CELOWNIK, HOTBAR) ---
+         ourShader.use();
+        glEnable(GL_CULL_FACE);
+        glDepthMask(GL_TRUE);
+
+        // Włącz transformację UV dla dropów
+        ourShader.setInt("u_useUVTransform", 1);
+
+        glBindVertexArray(dropVAO);
+
+        ourShader.setVec2("u_uvScale", 1.0f / ATLAS_COLS, 1.0f / ATLAS_ROWS);
+
+
+
+        for (const auto& item : g_droppedItems) {
+            glm::vec2 uvSide(0,0);
+            glm::vec2 uvTop(0,0);
+            glm::vec2 uvBottom(0,0); // <<< NOWOŚĆ
+            int useMulti = 0;
+
+            // --- Logika doboru tekstur ---
+            if (item.itemID == BLOCK_ID_GRASS) {
+                uvSide   = glm::vec2(UV_GRASS_SIDE[0], UV_GRASS_SIDE[1]);
+                uvTop    = glm::vec2(UV_GRASS_TOP[0], UV_GRASS_TOP[1]);
+                uvBottom = glm::vec2(UV_DIRT[0], UV_DIRT[1]); // Dół trawy to ZIEMIA
+                useMulti = 1;
+            }
+            else if (item.itemID == BLOCK_ID_LOG) {
+                uvSide   = glm::vec2(UV_LOG_SIDE[0], UV_LOG_SIDE[1]);
+                uvTop    = glm::vec2(UV_LOG_TOP[0], UV_LOG_TOP[1]);
+                uvBottom = uvTop; // Dół pnia jest taki sam jak góra
+                useMulti = 1;
+            }
+            // --- Reszta bloków (Jednolita tekstura) ---
+            else {
+                useMulti = 0;
+                if (item.itemID == BLOCK_ID_DIRT) uvSide = glm::vec2(UV_DIRT[0], UV_DIRT[1]);
+                else if (item.itemID == BLOCK_ID_STONE) uvSide = glm::vec2(UV_STONE[0], UV_STONE[1]);
+                else if (item.itemID == BLOCK_ID_TORCH) uvSide = glm::vec2(UV_TORCH[0], UV_TORCH[1]);
+                else if (item.itemID == BLOCK_ID_LEAVES) uvSide = glm::vec2(UV_LEAVES[0], UV_LEAVES[1]);
+                else if (item.itemID == BLOCK_ID_SAND) uvSide = glm::vec2(UV_SAND[0], UV_SAND[1]);
+                else if (item.itemID == BLOCK_ID_SANDSTONE) uvSide = glm::vec2(UV_SANDSTONE[0], UV_SANDSTONE[1]);
+                else if (item.itemID == BLOCK_ID_SNOW) uvSide = glm::vec2(UV_SNOW[0], UV_SNOW[1]);
+                else if (item.itemID == BLOCK_ID_ICE) uvSide = glm::vec2(UV_ICE[0], UV_ICE[1]);
+                else if (item.itemID == BLOCK_ID_BEDROCK) uvSide = glm::vec2(UV_BEDROCK[0], UV_BEDROCK[1]);
+                else if (item.itemID == BLOCK_ID_WATER) uvSide = glm::vec2(UV_WATER[0], UV_WATER[1]);
+                else if (item.itemID == BLOCK_ID_COAL_ORE) uvSide = glm::vec2(UV_COAL_ORE[0], UV_COAL_ORE[1]);
+                else if (item.itemID == BLOCK_ID_IRON_ORE) uvSide = glm::vec2(UV_IRON_ORE[0], UV_IRON_ORE[1]);
+                else if (item.itemID == BLOCK_ID_GOLD_ORE) uvSide = glm::vec2(UV_GOLD_ORE[0], UV_GOLD_ORE[1]);
+                else if (item.itemID == BLOCK_ID_DIAMOND_ORE) uvSide = glm::vec2(UV_DIAMOND_ORE[0], UV_DIAMOND_ORE[1]);
+
+                uvTop = uvSide;
+                uvBottom = uvSide;
+            }
+
+            // Wyślij wszystkie 3 offsety
+            ourShader.setVec2("u_uvOffset", uvSide);
+            ourShader.setVec2("u_uvOffsetTop", uvTop);
+            ourShader.setVec2("u_uvOffsetBottom", uvBottom); // <<< NOWOŚĆ
+            ourShader.setInt("u_multiTexture", useMulti);
+
+            // --- Macierz Modelu (Bez zmian) ---
+            glm::mat4 model = glm::mat4(1.0f);
+            model = glm::translate(model, item.position);
+            model = glm::rotate(model, item.rotationTime, glm::vec3(0, 1, 0));
+            // model = glm::rotate(model, glm::radians(20.0f), glm::vec3(1, 0, 1));
+
+            float hoverY = sin(item.rotationTime * 3.0f) * 0.1f;
+            model = glm::translate(model, glm::vec3(0, hoverY, 0));
+
+            if (item.itemID == BLOCK_ID_TORCH) {
+                model = glm::scale(model, glm::vec3(0.15f, 0.4f, 0.15f));
+            } else {
+                model = glm::scale(model, glm::vec3(0.25f));
+            }
+
+            ourShader.setMat4("model", model);
+            glDrawArrays(GL_TRIANGLES, 0, 36);
         }
+        uint8_t handItemID = g_inventory[g_activeSlot].itemID;
+
+        if (handItemID != BLOCK_ID_AIR) {
+            glClear(GL_DEPTH_BUFFER_BIT); // Czyścimy głębię - ręka zawsze na wierzchu
+            ourShader.use();
+
+            // Włącz transformację UV (używamy atlasu jak w dropach)
+            ourShader.setInt("u_useUVTransform", 1);
+            ourShader.setVec2("u_uvScale", 1.0f / ATLAS_COLS, 1.0f / ATLAS_ROWS);
+
+            // --- 1. Dobór Tekstur (Skopiowana logika z dropów) ---
+            glm::vec2 uvSide(0,0), uvTop(0,0), uvBottom(0,0);
+            int useMulti = 0;
+
+            if (handItemID == BLOCK_ID_GRASS) {
+                uvSide = glm::vec2(UV_GRASS_SIDE[0], UV_GRASS_SIDE[1]);
+                uvTop  = glm::vec2(UV_GRASS_TOP[0], UV_GRASS_TOP[1]);
+                uvBottom = glm::vec2(UV_DIRT[0], UV_DIRT[1]);
+                useMulti = 1;
+            }
+            else if (handItemID == BLOCK_ID_LOG) {
+                uvSide = glm::vec2(UV_LOG_SIDE[0], UV_LOG_SIDE[1]);
+                uvTop  = glm::vec2(UV_LOG_TOP[0], UV_LOG_TOP[1]);
+                uvBottom = uvTop;
+                useMulti = 1;
+            }
+            else {
+                // Reszta bloków (Skrócona wersja - dodaj inne jeśli brakuje)
+                useMulti = 0;
+                if (handItemID == BLOCK_ID_DIRT) uvSide = glm::vec2(UV_DIRT[0], UV_DIRT[1]);
+                else if (handItemID == BLOCK_ID_STONE) uvSide = glm::vec2(UV_STONE[0], UV_STONE[1]);
+                else if (handItemID == BLOCK_ID_TORCH) uvSide = glm::vec2(UV_TORCH[0], UV_TORCH[1]);
+                else if (handItemID == BLOCK_ID_LEAVES) uvSide = glm::vec2(UV_LEAVES[0], UV_LEAVES[1]);
+                else if (handItemID == BLOCK_ID_SAND) uvSide = glm::vec2(UV_SAND[0], UV_SAND[1]);
+                else if (handItemID == BLOCK_ID_WATER) uvSide = glm::vec2(UV_WATER[0], UV_WATER[1]);
+                else if (handItemID == BLOCK_ID_BEDROCK) uvSide = glm::vec2(UV_BEDROCK[0], UV_BEDROCK[1]);
+                else if (handItemID == BLOCK_ID_SNOW) uvSide = glm::vec2(UV_SNOW[0], UV_SNOW[1]);
+                else if (handItemID == ITEM_ID_PICKAXE) uvSide = glm::vec2(UV_PICKAXE[0], UV_PICKAXE[1]); // Np. 13. ikona
+
+                uvTop = uvSide; uvBottom = uvSide;
+            }
+
+            ourShader.setVec2("u_uvOffset", uvSide);
+            ourShader.setVec2("u_uvOffsetTop", uvTop);
+            ourShader.setVec2("u_uvOffsetBottom", uvBottom);
+            ourShader.setInt("u_multiTexture", useMulti);
+
+            // --- 2. Pozycja Ręki (Matematyka) ---
+            glm::mat4 handModel = glm::mat4(1.0f);
+
+            // Bazowa pozycja: przyklejona do kamery
+            glm::vec3 handPos = camera.Position + glm::vec3(0.0f, PLAYER_EYE_HEIGHT, 0.0f);
+
+            // Przesunięcie "w rękę" (Prawo, Dół, Przód)
+            // (Używamy wektorów kamery, żeby przedmiot się obracał razem z nami)
+            handPos += camera.Front * 0.4f;  // 0.4m przed twarzą
+            handPos += camera.Right * 0.25f; // 0.25m w prawo
+            handPos += camera.Up * -0.25f;   // 0.25m w dół
+
+            // Efekt "Bobbing" (Bujanie podczas chodzenia)
+            if (glm::length(playerVelocity.x) > 0.1f || glm::length(playerVelocity.z) > 0.1f) {
+                float bobSpeed = 12.0f;
+                float bobAmount = 0.02f;
+                // Bujanie góra-dół
+                handPos += camera.Up * (float)sin(glfwGetTime() * bobSpeed) * bobAmount;
+                // Bujanie lewo-prawo
+                handPos += camera.Right * (float)cos(glfwGetTime() * bobSpeed * 0.5f) * bobAmount;
+            }
+
+            handModel = glm::translate(handModel, handPos);
+
+            // Obrót: Przedmiot musi się obracać razem z kamerą
+            // Najpierw obracamy go tak jak patrzy gracz
+            handModel = glm::rotate(handModel, glm::radians(-camera.Yaw - 90.0f), glm::vec3(0, 1, 0));
+            handModel = glm::rotate(handModel, glm::radians(camera.Pitch), glm::vec3(1, 0, 0));
+
+            // Dodatkowy obrót "w nadgarstku" (żeby wyglądał naturalnie)
+            handModel = glm::rotate(handModel, glm::radians(30.0f), glm::vec3(0, 1, 0));
+            handModel = glm::rotate(handModel, glm::radians(-10.0f), glm::vec3(0, 0, 1));
+
+            // Skala
+            if (handItemID == BLOCK_ID_TORCH)
+                handModel = glm::scale(handModel, glm::vec3(0.12f, 0.35f, 0.12f));
+            else
+                handModel = glm::scale(handModel, glm::vec3(0.2f));
+
+            ourShader.setMat4("model", handModel);
+
+            // Rysuj
+            glBindVertexArray(dropVAO);
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+
+            ourShader.setInt("u_useUVTransform", 0); // Reset
+        }
+ourShader.use();
+        ourShader.setInt("u_useUVTransform", 1);
+        ourShader.setVec2("u_uvScale", 1.0f / ATLAS_COLS, 1.0f / ATLAS_ROWS);
+
+        glBindVertexArray(dropVAO);
+
+        for (const auto& p : g_particles) {
+            // 1. Wybór tekstury (Kopiujemy logikę z dropów/chunków)
+            glm::vec2 uvOff(0,0);
+
+            // Używamy tej samej logiki co dla dropów (tekstura boczna)
+            if (p.blockID == BLOCK_ID_GRASS) uvOff = glm::vec2(UV_GRASS_SIDE[0], UV_GRASS_SIDE[1]);
+            else if (p.blockID == BLOCK_ID_DIRT) uvOff = glm::vec2(UV_DIRT[0], UV_DIRT[1]);
+            else if (p.blockID == BLOCK_ID_STONE) uvOff = glm::vec2(UV_STONE[0], UV_STONE[1]);
+            else if (p.blockID == BLOCK_ID_LOG) uvOff = glm::vec2(UV_LOG_SIDE[0], UV_LOG_SIDE[1]);
+            else if (p.blockID == BLOCK_ID_LEAVES) uvOff = glm::vec2(UV_LEAVES[0], UV_LEAVES[1]);
+            else if (p.blockID == BLOCK_ID_TORCH) uvOff = glm::vec2(UV_TORCH[0], UV_TORCH[1]);
+            else if (p.blockID == BLOCK_ID_SAND) uvOff = glm::vec2(UV_SAND[0], UV_SAND[1]);
+            else if (p.blockID == BLOCK_ID_SANDSTONE) uvOff = glm::vec2(UV_SANDSTONE[0], UV_SANDSTONE[1]);
+            else if (p.blockID == BLOCK_ID_SNOW) uvOff = glm::vec2(UV_SNOW[0], UV_SNOW[1]);
+            else if (p.blockID == BLOCK_ID_ICE) uvOff = glm::vec2(UV_ICE[0], UV_ICE[1]);
+            else if (p.blockID == BLOCK_ID_BEDROCK) uvOff = glm::vec2(UV_BEDROCK[0], UV_BEDROCK[1]);
+            else if (p.blockID == BLOCK_ID_WATER) uvOff = glm::vec2(UV_WATER[0], UV_WATER[1]);
+
+            ourShader.setVec2("u_uvOffset", uvOff);
+
+            // 2. Macierz Modelu
+            glm::mat4 model = glm::mat4(1.0f);
+            model = glm::translate(model, p.position);
+
+            // Cząsteczki się obracają losowo w czasie lotu (prosty trik)
+            model = glm::rotate(model, p.lifetime * 10.0f, glm::vec3(1, 1, 0));
+
+            // SKALA: Cząsteczki maleją, gdy umierają
+            float scale = (p.lifetime / p.maxLifetime) * 0.15f; // Startują jako 0.15, kończą jako 0.0
+            model = glm::scale(model, glm::vec3(scale));
+
+            ourShader.setMat4("model", model);
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+        }
+        // Wyłącz transformację UV
+        ourShader.setInt("u_useUVTransform", 0);
+            ourShader.use();
+            // Wyłączamy tekstury z atlasu, żeby użyć jednolitego koloru
+            // (W shaderze musielibyśmy dodać obsługę koloru, ale na razie użyjmy triku:
+            // Wybierzemy biały fragment atlasu, np. Śnieg, i zmieszamy go z kolorem światła)
+
+            // Lepsza opcja na szybko: Użyjmy tekstury DESEK (Planks) lub SAND dla świnki
+            // Zakładam, że Sandstone to świnka ;)
+
+            ourShader.setInt("u_useUVTransform", 1);
+            ourShader.setVec2("u_uvScale", 1.0f / ATLAS_COLS, 1.0f / ATLAS_ROWS);
+
+            glBindVertexArray(dropVAO);
+
+
+        // 3A: Słońce 2D
 
         // PRZEBIEG 3: UI (Celownik)
         glDisable(GL_DEPTH_TEST);
         crosshairShader.use();
-        glm::mat4 ortho_projection = glm::ortho(0.0f, (float)SCR_WIDTH, 0.0f, (float)SCR_HEIGHT);
+        // glm::mat4 ortho_projection = glm::ortho(0.0f, (float)SCR_WIDTH, 0.0f, (float)SCR_HEIGHT);
         crosshairShader.setMat4("projection", ortho_projection);
         glBindVertexArray(crosshairVAO);
         glDrawArrays(GL_LINES, 0, 4);
@@ -1092,7 +2000,7 @@ int main()
 
         // --- 2. Rysuj 9 Ikon Bloków ---
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, iconsTextureID);
+        // glBindTexture(GL_TEXTURE_2D, iconsTextureID);
         uiShader.setInt("uiTexture", 0);
 
         float ICON_SIZE = 52.0f; // Ikony są mniejsze (52x52)
@@ -1112,21 +2020,103 @@ int main()
             uiShader.setMat4("model", model);
 
             // --- Logika wyboru ikony ---
-            uint8_t blockID = g_hotbarSlots[i];
+            uint8_t blockID = g_inventory[i].itemID;;
 
             float iconIndex = 0.0f;
             if (blockID == BLOCK_ID_GRASS) iconIndex = 0.0f;
             else if (blockID == BLOCK_ID_DIRT) iconIndex = 1.0f;
             else if (blockID == BLOCK_ID_STONE) iconIndex = 2.0f;
             else if (blockID == BLOCK_ID_WATER) iconIndex = 3.0f;
+            else if (blockID == BLOCK_ID_SAND ) iconIndex = 4.0f;
+            else if (blockID == BLOCK_ID_SANDSTONE) iconIndex = 5.0f;
+            else if (blockID == BLOCK_ID_SNOW) iconIndex = 6.0f;
+            else if (blockID == BLOCK_ID_ICE) iconIndex = 7.0f;
+            else if (blockID == BLOCK_ID_BEDROCK) iconIndex = 8.0f;
+            else if (blockID == BLOCK_ID_TORCH) iconIndex = 9.0f; // Pamiętaj o dodaniu mapowania dla TORCH i LOG/LEAVES
+            else if (blockID == BLOCK_ID_LOG) iconIndex = 10.0f;
+            else if (blockID == BLOCK_ID_LEAVES) iconIndex = 11.0f;
+            else if (blockID == ITEM_ID_PICKAXE) iconIndex = 12.0f; // Np. 13. ikona
             // (Tu zmapuj resztę slotów 4-8, na razie będą się powtarzać)
+            else if (blockID == BLOCK_ID_COAL_ORE)    iconIndex = 13.0f;
+            else if (blockID == BLOCK_ID_IRON_ORE)    iconIndex = 14.0f;
+            else if (blockID == BLOCK_ID_GOLD_ORE)    iconIndex = 15.0f;
+            else if (blockID == BLOCK_ID_DIAMOND_ORE) iconIndex = 16.0f;
 
             // Przesuwamy UV do odpowiedniej ikony
             glm::vec2 uvOffset(iconIndex / ICON_ATLAS_COLS, 0.0f);
             uiShader.setVec2("u_uvOffset", uvOffset);
+            glBindTexture(GL_TEXTURE_2D, iconsTextureID);
+            if (blockID != BLOCK_ID_AIR) {
+                glDrawArrays(GL_TRIANGLES, 0, 6);
+            }
+            if (g_inventory[i].maxDurability > 0) {
+                DrawDurabilityBar(uiShader, hotbarVAO, x_pos, y_pos, SLOT_SIZE, SLOT_SIZE,
+                                  g_inventory[i].durability, g_inventory[i].maxDurability);
+            }
+            else if (g_inventory[i].count > 1) {
+                std::string countStr = std::to_string(g_inventory[i].count);
+                float FONT_SIZE = 16.0f;
+                // Rysuj w prawym dolnym rogu slotu
+                float textX = x_pos + ICON_SIZE - (countStr.length() * FONT_SIZE * 0.6f) - 2.0f;
+                float textY = y_pos + 2.0f;
 
-            glDrawArrays(GL_TRIANGLES, 0, 6);
+                glEnable(GL_BLEND);
+                RenderText(uiShader, hotbarVAO, countStr, textX, textY, FONT_SIZE);
+                glDisable(GL_BLEND);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, iconsTextureID);
+                uiShader.setVec2("u_uvScale", 1.0f / ICON_ATLAS_COLS, 1.0f / ICON_ATLAS_ROWS); // Reset skali
+            }
         }
+            if (!isDead && !camera.flyingMode) { // Nie pokazuj w Creative
+                float heartSize = 27.0f;
+                float startX = SCR_WIDTH / 2.0f - 150.0f; // Na lewo od hotbara
+                float startY = 80.0f; // Nad hotbarem
+
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, iconsTextureID); // Używamy atlasu ikon
+
+                // Zakładam, że serce to jakaś ikona w atlasie.
+                // Jeśli nie masz serca, użyjmy np. indeksu 12 (jeśli masz tam coś czerwonego)
+                // lub dodaj serce do ui_icons.png!
+                float heartIndex = 17.0f;
+
+                uiShader.setVec2("u_uvScale", 1.0f / ICON_ATLAS_COLS, 1.0f / ICON_ATLAS_ROWS);
+                uiShader.setVec2("u_uvOffset", heartIndex / ICON_ATLAS_COLS, 0.0f);
+
+                // Rysujemy tyle serc, ile mamy zdrowia
+                for (int i = 0; i < (int)playerHealth; i++) {
+                    DrawMenuButton(uiShader, hotbarVAO, iconsTextureID,
+                                  startX + (i * (heartSize + 2)), startY,
+                                  heartSize, heartSize);
+                }
+            }
+            if (isDead) {
+                // 1. Czerwony filtr na ekran
+                glDisable(GL_DEPTH_TEST);
+                glEnable(GL_BLEND);
+                uiShader.use();
+                uiShader.setFloat("u_opacity", 0.5f); // Półprzezroczysty
+
+                // (Używamy texOverlay, ale możesz dodać czerwoną teksturę "death.png")
+                DrawMenuButton(uiShader, hotbarVAO, texOverlay, 0, 0, SCR_WIDTH, SCR_HEIGHT);
+
+                // 2. Napis "Nie żyjesz!"
+                uiShader.setFloat("u_opacity", 1.0f);
+                RenderText(uiShader, hotbarVAO, "GAME OVER", SCR_WIDTH/2 - 100, SCR_HEIGHT/2 + 50, 40.0f);
+                RenderText(uiShader, hotbarVAO, "Nacisnij R aby odrodzic", SCR_WIDTH/2 - 180, SCR_HEIGHT/2 - 20, 20.0f);
+
+                // 3. Logika Respawnu (Klawisz R)
+                if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS) {
+                    isDead = false;
+                    playerHealth = playerMaxHealth;
+                    airTimer = 10.0f;
+                    playerVelocity = glm::vec3(0.0f);
+
+                    // Teleport na spawn (wysoko)
+                    camera.Position = glm::vec3(8.0f, 50.0f, 8.0f);
+                }
+            }
 
         // --- 3. Rysuj Selekter (Ramka podświetlenia) ---
         glActiveTexture(GL_TEXTURE0);
@@ -1159,11 +2149,940 @@ int main()
 
             break; // Koniec case STATE_IN_GAME
         }
+           case STATE_INVENTORY:
+        {
+            // --- KROK 1: Narysuj "zamrożony" świat w tle (PEŁEN KOD) ---
+            {
+                int playerChunkX = static_cast<int>(floor(camera.Position.x / CHUNK_WIDTH));
+                int playerChunkZ = static_cast<int>(floor(camera.Position.z / CHUNK_DEPTH));
+                // --- Obliczenia Cyklu Dnia/Nocy ---
+                // (Musimy je obliczyć, aby tło wyglądało identycznie jak w grze)
+                float dayDuration = 300.0f;
+            float startTimeOffset = dayDuration * 0.3f;
+            float timeOfDay = fmod(glfwGetTime() + startTimeOffset, dayDuration) / dayDuration;
+            float sunAngle = timeOfDay * 2.0f * 3.14159f;
 
+            // Słońce
+            glm::vec3 sunDirection = glm::normalize(glm::vec3(sin(sunAngle), cos(sunAngle), 0.3f));
+            float daylightFactor = std::clamp(-sunDirection.y, 0.0f, 1.0f);
+
+            // Kolory
+            glm::vec3 daySkyColor = glm::vec3(0.5f, 0.8f, 1.0f);
+            glm::vec3 nightSkyColor = glm::vec3(0.02f, 0.02f, 0.08f);
+            glm::vec3 currentSkyColor = mix(nightSkyColor, daySkyColor, daylightFactor);
+            glm::vec3 sunAmbient = mix(glm::vec3(0.05f), glm::vec3(0.3f), daylightFactor);
+            glm::vec3 sunDiffuse = mix(glm::vec3(0.0f), glm::vec3(0.7f), daylightFactor);
+
+            // Macierze
+            float viewDistance = (RENDER_DISTANCE + 1) * CHUNK_WIDTH;
+            glm::mat4 projection = glm::perspective(glm::radians(camera.Zoom), (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, viewDistance);
+            glm::mat4 view = camera.GetViewMatrix();
+
+            // Czyść Ekran
+            glClearColor(currentSkyColor.x, currentSkyColor.y, currentSkyColor.z, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+
+            // 2. MAPA CIENIA (PRZEBIEG 1)
+            {
+                float shadowRange = 180.0f;
+                glm::mat4 lightProjection = glm::ortho(-shadowRange, shadowRange, -shadowRange, shadowRange, 1.0f, 150.0f);
+                glm::vec3 lightCamPos = camera.Position - (sunDirection * 50.0f);
+                glm::mat4 lightView = glm::lookAt(lightCamPos, camera.Position, glm::vec3(0.0, 1.0, 0.0));
+                glm::mat4 lightSpaceMatrix = lightProjection * lightView;
+
+                depthShader.use();
+                depthShader.setMat4("lightSpaceMatrix", lightSpaceMatrix);
+
+                glViewport(0, 0, SHADOW_WIDTH, SHADOW_HEIGHT);
+                glBindFramebuffer(GL_FRAMEBUFFER, shadowMapFBO);
+                glClear(GL_DEPTH_BUFFER_BIT);
+
+                // --- KLUCZOWA POPRAWKA: ZMIANA CULLINGU ---
+                // Rysujemy TYLNE ściany do mapy cienia.
+                // To eliminuje "Shadow Acne" (paski) na oświetlonych powierzchniach.
+                glCullFace(GL_FRONT);
+                // ------------------------------------------
+
+                int pCX = static_cast<int>(floor(camera.Position.x / CHUNK_WIDTH));
+                int pCZ = static_cast<int>(floor(camera.Position.z / CHUNK_DEPTH));
+
+                for (int x = pCX - RENDER_DISTANCE; x <= pCX + RENDER_DISTANCE; x++) {
+                    for (int z = pCZ - RENDER_DISTANCE; z <= pCZ + RENDER_DISTANCE; z++) {
+                        auto it = g_WorldChunks.find(glm::ivec2(x, z));
+                        if (it != g_WorldChunks.end()) {
+                            // Rysujemy tylko solidne bloki do cienia (bez wody/liści dla wydajności)
+                            it->second->DrawSolid(depthShader, textureAtlas);
+                        }
+                    }
+                }
+
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+                // --- PRZYWRÓĆ NORMALNY CULLING ---
+                glCullFace(GL_BACK);
+                // ---------------------------------
+            }
+
+
+            // 3. SKYBOX (PRZEBIEG 2A)
+            glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT); // Reset viewportu
+
+            if (cubemapTexture != 0)
+            {
+                glDepthFunc(GL_LEQUAL);
+                skyboxShader.use();
+                skyboxShader.setMat4("projection", projection);
+                skyboxShader.setMat4("view", glm::mat4(glm::mat3(view)));
+                glBindVertexArray(skyboxVAO);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_CUBE_MAP, cubemapTexture);
+                glDrawArrays(GL_TRIANGLES, 0, 36);
+                glBindVertexArray(0);
+                glDepthFunc(GL_LESS);
+            }
+
+
+
+                // --- PRZEBIEG 2B: ŚWIAT (SOLID) ---
+                ourShader.use();
+                ourShader.setMat4("projection", projection);
+                ourShader.setMat4("view", view);
+                ourShader.setVec3("viewPos", camera.Position);
+                ourShader.setVec3("u_fogColor", currentSkyColor);
+                ourShader.setFloat("u_fogStart", (RENDER_DISTANCE - 2) * CHUNK_WIDTH);
+                ourShader.setFloat("u_fogEnd", (RENDER_DISTANCE + 1) * CHUNK_WIDTH);
+                ourShader.setVec3("u_dirLight.direction", sunDirection);
+                ourShader.setVec3("u_dirLight.ambient", sunAmbient);
+                ourShader.setVec3("u_dirLight.diffuse", sunDiffuse);
+                ourShader.setVec3("u_dirLight.specular", 0.5f, 0.5f, 0.5f);
+
+                int lightCount = 0;
+                for (const auto& torchPos : g_torchPositions)
+                {
+                    if (lightCount >= MAX_POINT_LIGHTS) break;
+                    std::string base = "u_pointLights[" + std::to_string(lightCount) + "]";
+
+                    ourShader.setVec3(base + ".position", torchPos);
+                    ourShader.setVec3(base + ".ambient", 0.05f, 0.02f, 0.0f);
+
+                    // --- EFEKT MIGOTANIA ---
+                    // Używamy czasu i pozycji pochodni, żeby każda migała inaczej
+                    // Mieszamy dwa sinusy, żeby ruch był bardziej "chaotyczny"
+                    float flicker = sin(glfwGetTime() * 10.0f + torchPos.x) * 0.05f +
+                                    cos(glfwGetTime() * 23.0f + torchPos.z) * 0.05f;
+
+                    // Kolor ognia (Ciepły pomarańcz)
+                    ourShader.setVec3(base + ".diffuse", 1.5f + flicker, 0.9f + flicker, 0.4f);
+                    ourShader.setVec3(base + ".specular", 1.5f, 0.9f, 0.4f);
+
+                    ourShader.setFloat(base + ".constant", 1.0f);
+                    // Zmieniamy zasięg w rytm migotania
+                    ourShader.setFloat(base + ".linear", 0.09f + flicker * 0.1f);
+                    ourShader.setFloat(base + ".quadratic", 0.032f);
+
+                    lightCount++;
+                }
+                ourShader.setInt("u_pointLightCount", lightCount);
+
+                float shadowRange = 180.0f;
+                glm::mat4 lightProjection = glm::ortho(-shadowRange, shadowRange, -shadowRange, shadowRange, 1.0f, 150.0f);
+                glm::vec3 lightCamPos = camera.Position - (sunDirection * 50.0f);
+                glm::mat4 lightView = glm::lookAt(lightCamPos, camera.Position, glm::vec3(0.0, 1.0, 0.0));
+                glm::mat4 lightSpaceMatrix = lightProjection * lightView;
+                ourShader.setMat4("lightSpaceMatrix", lightSpaceMatrix);
+
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, shadowMapTexture);
+
+                glDepthMask(GL_TRUE);
+                glEnable(GL_CULL_FACE);
+                for (int x = playerChunkX - RENDER_DISTANCE; x <= playerChunkX + RENDER_DISTANCE; x++) {
+                    for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
+                        auto it = g_WorldChunks.find(glm::ivec2(x, z));
+                        if (it != g_WorldChunks.end()) {
+                            it->second->DrawSolid(ourShader, textureAtlas);
+                        }
+                    }
+                }
+
+                // --- PRZEBIEG 2C: LIŚCIE I POCHODNIE ---
+                ourShader.use();
+                glDepthMask(GL_TRUE);
+                glDisable(GL_CULL_FACE);
+                for (int x = playerChunkX - RENDER_DISTANCE; x <= playerChunkX + RENDER_DISTANCE; x++) {
+                    for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
+                        auto it = g_WorldChunks.find(glm::ivec2(x, z));
+                        if (it != g_WorldChunks.end()) {
+                            it->second->DrawFoliage(ourShader, textureAtlas);
+                        }
+                    }
+                }
+
+                // (Nie rysujemy podświetlenia w menu pauzy/ekwipunku)
+
+                // --- PRZEBIEG 2E: WODA (SORTOWANA) ---
+                ourShader.use();
+                glDepthMask(GL_FALSE);
+                glEnable(GL_BLEND);
+                // glDisable(GL_CULL_FACE); // Już wyłączone z przebiegu 2C
+
+                std::map<float, Chunk*, std::greater<float>> sortedChunks;
+                for (int x = playerChunkX - RENDER_DISTANCE; x <= playerChunkX + RENDER_DISTANCE; x++) {
+                    for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
+                        auto it = g_WorldChunks.find(glm::ivec2(x, z));
+                        if (it != g_WorldChunks.end()) {
+                            Chunk* chunk = it->second;
+                            glm::vec3 chunkCenter = chunk->position + glm::vec3(CHUNK_WIDTH / 2.0f, CHUNK_HEIGHT / 2.0f, CHUNK_DEPTH / 2.0f);
+                            glm::vec3 vecToChunk = camera.Position - chunkCenter;
+                            float distanceSq = glm::dot(vecToChunk, vecToChunk);
+                            sortedChunks[distanceSq] = chunk;
+                        }
+                    }
+                }
+                for (auto const& [dist, chunk] : sortedChunks)
+                {
+                    chunk->DrawTransparent(ourShader, textureAtlas);
+                }
+                glEnable(GL_CULL_FACE);
+                glDepthMask(GL_TRUE);
+ourShader.use();
+        glEnable(GL_CULL_FACE);
+        glDepthMask(GL_TRUE);
+
+        // Włącz transformację UV dla dropów
+        ourShader.setInt("u_useUVTransform", 1);
+
+        glBindVertexArray(dropVAO); // Używamy naszego małego sześcianu
+
+        for (const auto& item : g_droppedItems) {
+            // 1. Oblicz UV Offset na podstawie ID
+            float iconIndex = 0.0f;
+            if (item.itemID == BLOCK_ID_GRASS) iconIndex = 0.0f;
+            else if (item.itemID == BLOCK_ID_DIRT) iconIndex = 1.0f;
+            else if (item.itemID == BLOCK_ID_STONE) iconIndex = 2.0f;
+            else if (item.itemID == BLOCK_ID_TORCH) iconIndex = 9.0f;
+            // ... (reszta Twoich if-ów)
+
+            // Dla testu - po prostu rysujmy (tu możesz dodać dokładniejszą logikę)
+            glm::vec2 uvOff(0,0);
+            // Przykład manualnego mapowania (dostosuj do swojego atlasu):
+            if (item.itemID == BLOCK_ID_DIRT) uvOff = glm::vec2(0.0f, 1.0f/3.0f);
+            else if (item.itemID == BLOCK_ID_STONE) uvOff = glm::vec2(0.25f, 1.0f/3.0f);
+
+            // UWAGA: To jest przykładowe mapowanie.
+            // Docelowo iconIndex powinien sterować uvOff tak jak w UI.
+
+            ourShader.setVec2("u_uvOffset", uvOff);
+            ourShader.setVec2("u_uvScale", 1.0f/4.0f, 1.0f/3.0f); // Skala atlasu bloków (4 kolumny, 3 rzędy)
+
+            // 2. Macierz Modelu (Ruch + Obrót + Skala)
+            glm::mat4 model = glm::mat4(1.0f);
+            model = glm::translate(model, item.position);
+            model = glm::rotate(model, item.rotationTime, glm::vec3(0, 1, 0)); // Obrót wokół Y
+
+            // Efekt lewitowania (Bobbing)
+            float hoverY = sin(item.rotationTime * 3.0f) * 0.1f;
+            model = glm::translate(model, glm::vec3(0, hoverY, 0));
+
+            model = glm::scale(model, glm::vec3(0.25f)); // Mały blok (1/4 wielkości)
+
+            ourShader.setMat4("model", model);
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+        }
+
+        // Wyłącz transformację UV (żeby nie popsuć chunków w następnej klatce)
+        ourShader.setInt("u_useUVTransform", 0);
+            } // Koniec bloku renderowania tła 3D
+            glDisable(GL_DEPTH_TEST);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+            uiShader.use();
+            uiShader.setMat4("projection", ortho_projection);
+
+            uiShader.setFloat("u_opacity", 0.77f); // Półprzezroczystość
+            uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+            uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+
+            // Użyj tej samej tekstury 'texOverlay' co w menu pauzy
+            DrawMenuButton(uiShader, hotbarVAO, texOverlay, 0.0f, 0.0f, SCR_WIDTH, SCR_HEIGHT);
+            // --- KONIEC NOWEGO BLOKU ---
+            // --- KROK 2: Narysuj UI Ekwipunku ---
+            glDisable(GL_DEPTH_TEST);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+            uiShader.use();
+            uiShader.setMat4("projection", ortho_projection);
+            uiShader.setFloat("u_opacity", 1.0f);
+
+            // Definicje siatki (3 wiersze po 9 slotów)
+            float invSlotSize = SLOT_SIZE;
+            float invSlotGap = 4.0f;
+            float invWidth = (invSlotSize * 9) + (invSlotGap * 8);
+            float invStartX = (SCR_WIDTH - invWidth) / 2.0f;
+            float invStartY = (SCR_HEIGHT / 2.0f) - 50.0f;
+
+            // Pętla rysująca 27 slotów "plecaka"
+            for (int i = 0; i < 27; i++) {
+                int row = i / 9;
+                int col = i % 9;
+                int slotIndex = i + 9;
+
+                float x_pos = invStartX + col * (invSlotSize + invSlotGap);
+                float y_pos = invStartY - row * (invSlotSize + invSlotGap);
+
+                // Rysuj tło slotu
+                uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+                uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+                DrawMenuButton(uiShader, hotbarVAO, slotTextureID, x_pos, y_pos, invSlotSize, invSlotSize);
+
+                // Rysuj ikonę przedmiotu (jeśli jest)
+                uint8_t itemID = g_inventory[slotIndex].itemID;
+                if (itemID != BLOCK_ID_AIR) {
+                    float iconSize = 52.0f;
+                    float iconX = x_pos + (invSlotSize - iconSize) / 2.0f;
+                    float iconY = y_pos + (invSlotSize - iconSize) / 2.0f;
+
+                    float iconIndex = 0.0f;
+                    if (itemID == BLOCK_ID_GRASS) iconIndex = 0.0f;
+                    else if (itemID == BLOCK_ID_DIRT) iconIndex = 1.0f;
+                    else if (itemID == BLOCK_ID_STONE) iconIndex = 2.0f;
+                    else if (itemID == BLOCK_ID_WATER) iconIndex = 3.0f;
+                    else if (itemID == BLOCK_ID_SAND ) iconIndex = 4.0f;
+                    else if (itemID == BLOCK_ID_SANDSTONE) iconIndex = 5.0f;
+                    else if (itemID == BLOCK_ID_SNOW) iconIndex = 6.0f;
+                    else if (itemID == BLOCK_ID_ICE) iconIndex = 7.0f;
+                    else if (itemID == BLOCK_ID_BEDROCK) iconIndex = 8.0f;
+                    else if (itemID == BLOCK_ID_TORCH) iconIndex = 9.0f;
+                    else if (itemID == BLOCK_ID_LOG) iconIndex = 10.0f;
+                    else if (itemID == BLOCK_ID_LEAVES) iconIndex = 11.0f;
+                    else if (itemID == ITEM_ID_PICKAXE) iconIndex = 12.0f; // Np. 13. ikona
+                    else if (itemID == BLOCK_ID_COAL_ORE)    iconIndex = 13.0f;
+                    else if (itemID == BLOCK_ID_IRON_ORE)    iconIndex = 14.0f;
+                    else if (itemID == BLOCK_ID_GOLD_ORE)    iconIndex = 15.0f;
+                    else if (itemID == BLOCK_ID_DIAMOND_ORE) iconIndex = 16.0f;
+
+                    glm::vec2 uvScale(1.0f / ICON_ATLAS_COLS, 1.0f / ICON_ATLAS_ROWS);
+                    glm::vec2 uvOffset(iconIndex / ICON_ATLAS_COLS, 0.0f);
+                    uiShader.setVec2("u_uvScale", uvScale);
+                    uiShader.setVec2("u_uvOffset", uvOffset);
+
+                    // --- POPRAWKA: Ręczne rysowanie zamiast DrawMenuButton ---
+                    // DrawMenuButton resetuje teksturę, psując RenderText
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D, iconsTextureID);
+                    glm::mat4 model = glm::mat4(1.0f);
+                    model = glm::translate(model, glm::vec3(iconX, iconY, 0.0f));
+                    model = glm::scale(model, glm::vec3(iconSize, iconSize, 1.0f));
+                    uiShader.setMat4("model", model);
+                    glDrawArrays(GL_TRIANGLES, 0, 6);
+                    // --- KONIEC POPRAWKI ---
+
+                    // Rysuj licznik
+                    if (g_inventory[slotIndex].count > 1) {
+                        std::string countStr = std::to_string(g_inventory[slotIndex].count);
+                        float FONT_SIZE = 16.0f;
+                        float textX = iconX + iconSize - (countStr.length() * FONT_SIZE * 0.6f) - 2.0f;
+                        float textY = iconY + 2.0f;
+                        RenderText(uiShader, hotbarVAO, countStr, textX, textY, FONT_SIZE);
+
+                        // --- POPRAWKA: Zresetuj stan dla następnej iteracji pętli ---
+                        // (RenderText zmienia teksturę i skalę UV)
+                        glActiveTexture(GL_TEXTURE0);
+                        glBindTexture(GL_TEXTURE_2D, slotTextureID); // Przygotuj dla DrawMenuButton
+                        uiShader.setVec2("u_uvScale", 1.0f, 1.0f); // DrawMenuButton oczekuje (1,1)
+                        // --- KONIEC POPRAWKI ---
+                    }
+                }
+            }
+            float craftStartX = invStartX + (invSlotSize + invSlotGap) * 5.0f;
+            float craftStartY = invStartY + (invSlotSize + invSlotGap) * 4.0f;
+
+            // 1. Siatka Wejściowa
+            for (int i = 0; i < 4; i++) {
+                int row = i / 2;
+                int col = i % 2;
+                float x = craftStartX + col * (invSlotSize + invSlotGap);
+                float y = craftStartY - row * (invSlotSize + invSlotGap);
+
+                // Tło
+                uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+                uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+                DrawMenuButton(uiShader, hotbarVAO, slotTextureID, x, y, invSlotSize, invSlotSize);
+
+                // Przedmiot
+                if (g_craftingGrid[i].itemID != BLOCK_ID_AIR) {
+                    float iconSize = 52.0f;
+                    float iconX = x + (invSlotSize - iconSize) / 2.0f;
+                    float iconY = y + (invSlotSize - iconSize) / 2.0f;
+
+                    // 2. Mapowanie ID na ikonę (To samo co w reszcie gry)
+                    uint8_t itemID = g_craftingGrid[i].itemID;
+                    float iconIndex = 0.0f;
+
+                    if (itemID == BLOCK_ID_GRASS) iconIndex = 0.0f;
+                    else if (itemID == BLOCK_ID_DIRT) iconIndex = 1.0f;
+                    else if (itemID == BLOCK_ID_STONE) iconIndex = 2.0f;
+                    else if (itemID == BLOCK_ID_WATER) iconIndex = 3.0f;
+                    else if (itemID == BLOCK_ID_BEDROCK) iconIndex = 4.0f;
+                    else if (itemID == BLOCK_ID_SAND ) iconIndex = 5.0f;
+                    else if (itemID == BLOCK_ID_SANDSTONE) iconIndex = 6.0f;
+                    else if (itemID == BLOCK_ID_SNOW) iconIndex = 7.0f;
+                    else if (itemID == BLOCK_ID_ICE) iconIndex = 8.0f;
+                    else if (itemID == BLOCK_ID_TORCH) iconIndex = 9.0f;
+                    else if (itemID == BLOCK_ID_LOG) iconIndex = 10.0f;
+                    else if (itemID == BLOCK_ID_LEAVES) iconIndex = 11.0f;
+                    else if (itemID == ITEM_ID_PICKAXE) iconIndex = 12.0f; // Np. 13. ikona
+                    else if (itemID == BLOCK_ID_COAL_ORE)    iconIndex = 13.0f;
+                    else if (itemID == BLOCK_ID_IRON_ORE)    iconIndex = 14.0f;
+                    else if (itemID == BLOCK_ID_GOLD_ORE)    iconIndex = 15.0f;
+                    else if (itemID == BLOCK_ID_DIAMOND_ORE) iconIndex = 16.0f;
+
+                    // 3. Rysowanie Ikony
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D, iconsTextureID);
+
+                    uiShader.setVec2("u_uvScale", 1.0f / ICON_ATLAS_COLS, 1.0f / ICON_ATLAS_ROWS);
+                    uiShader.setVec2("u_uvOffset", iconIndex / ICON_ATLAS_COLS, 0.0f);
+
+                    glm::mat4 model = glm::mat4(1.0f);
+                    model = glm::translate(model, glm::vec3(iconX, iconY, 0.0f));
+                    model = glm::scale(model, glm::vec3(iconSize, iconSize, 1.0f));
+                    uiShader.setMat4("model", model);
+
+                    glDrawArrays(GL_TRIANGLES, 0, 6);
+
+                    // 4. Rysowanie Licznika (jeśli > 1)
+                    if (g_craftingGrid[i].count > 1) {
+                        std::string c = std::to_string(g_craftingGrid[i].count);
+                        float FONT_SIZE = 16.0f;
+                        float textX = iconX + iconSize - (c.length() * FONT_SIZE * 0.6f) - 2.0f;
+                        float textY = iconY + 2.0f;
+
+                        glEnable(GL_BLEND);
+                        RenderText(uiShader, hotbarVAO, c, textX, textY, FONT_SIZE);
+                        glDisable(GL_BLEND);
+
+                        // WAŻNE: Reset po RenderText, żeby następna ikona się dobrze narysowała
+                        glActiveTexture(GL_TEXTURE0);
+                        glBindTexture(GL_TEXTURE_2D, iconsTextureID);
+                    }
+                }
+            }
+
+            // 2. Slot Wyniku
+            float resultX = craftStartX + (invSlotSize + invSlotGap) * 3.0f;
+            float resultY = craftStartY - 0.5f * (invSlotSize + invSlotGap);
+
+            // Tło
+            uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+            uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+            DrawMenuButton(uiShader, hotbarVAO, slotTextureID, resultX, resultY, invSlotSize, invSlotSize);
+
+            // Wynik
+            if (g_craftingOutput.itemID != BLOCK_ID_AIR) {
+                 float iconSize = 52.0f;
+                 float iconX = resultX + (invSlotSize - iconSize) / 2.0f;
+                 float iconY = resultY + (invSlotSize - iconSize) / 2.0f;
+
+                 // 2. Mapowanie ID na indeks w atlasie
+                 // (Musi być zgodne z resztą gry)
+                 uint8_t outID = g_craftingOutput.itemID;
+                 float iconIndex = 0.0f;
+
+                 if (outID == BLOCK_ID_GRASS) iconIndex = 0.0f;
+                 else if (outID == BLOCK_ID_DIRT) iconIndex = 1.0f;
+                 else if (outID == BLOCK_ID_STONE) iconIndex = 2.0f;
+                 else if (outID == BLOCK_ID_WATER) iconIndex = 3.0f;
+                 else if (outID == BLOCK_ID_BEDROCK) iconIndex = 4.0f;
+                 else if (outID == BLOCK_ID_SAND ) iconIndex = 5.0f;
+                 else if (outID == BLOCK_ID_SANDSTONE) iconIndex = 6.0f;
+                 else if (outID == BLOCK_ID_SNOW) iconIndex = 7.0f;
+                 else if (outID == BLOCK_ID_ICE) iconIndex = 8.0f;
+                 else if (outID == BLOCK_ID_TORCH) iconIndex = 9.0f;
+                 else if (outID == BLOCK_ID_LOG) iconIndex = 10.0f;
+                 else if (outID == BLOCK_ID_LEAVES) iconIndex = 11.0f;
+                 else if (outID == ITEM_ID_PICKAXE) iconIndex = 12.0f; // Np. 13. ikona
+
+                 // 3. Ustawienia Shadera (Tekstura i UV)
+                 glActiveTexture(GL_TEXTURE0);
+                 glBindTexture(GL_TEXTURE_2D, iconsTextureID);
+                 uiShader.setVec2("u_uvScale", 1.0f / ICON_ATLAS_COLS, 1.0f / ICON_ATLAS_ROWS);
+                 uiShader.setVec2("u_uvOffset", iconIndex / ICON_ATLAS_COLS, 0.0f);
+
+                 // 4. Rysowanie Ikony
+                 glm::mat4 model = glm::mat4(1.0f);
+                 model = glm::translate(model, glm::vec3(iconX, iconY, 0.0f));
+                 model = glm::scale(model, glm::vec3(iconSize, iconSize, 1.0f));
+                 uiShader.setMat4("model", model);
+                 glDrawArrays(GL_TRIANGLES, 0, 6);
+
+                 // 5. Rysowanie Licznika (jeśli > 1)
+                 if (g_craftingOutput.count > 1) {
+                      std::string c = std::to_string(g_craftingOutput.count);
+                      float FONT_SIZE = 16.0f;
+                      float textX = iconX + iconSize - (c.length() * FONT_SIZE * 0.6f) - 2.0f;
+                      float textY = iconY + 2.0f;
+
+                      RenderText(uiShader, hotbarVAO, c, textX, textY, FONT_SIZE);
+
+                      // Reset po tekście
+                      glActiveTexture(GL_TEXTURE0);
+                      glBindTexture(GL_TEXTURE_2D, iconsTextureID);
+                 }
+            }
+            // --- KROK 3: Rysuj Hotbar (w UI Ekwipunku) ---
+            // (Skopiowany kod z STATE_IN_GAME)
+            {
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, slotTextureID);
+                uiShader.setInt("uiTexture", 0);
+                uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+                uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+
+                for (int i = 0; i < HOTBAR_SIZE; i++) {
+                    float x_pos = BAR_START_X + i * (SLOT_SIZE + GAP);
+                    float y_pos = 10.0f;
+                    DrawMenuButton(uiShader, hotbarVAO, slotTextureID, x_pos, y_pos, SLOT_SIZE, SLOT_SIZE);
+                }
+
+                float ICON_SIZE = 52.0f;
+                glm::vec2 uvScale(1.0f / ICON_ATLAS_COLS, 1.0f / ICON_ATLAS_ROWS);
+                uiShader.setVec2("u_uvScale", uvScale);
+
+                for (int i = 0; i < HOTBAR_SIZE; i++) {
+                    float x_pos = BAR_START_X + i * (SLOT_SIZE + GAP) + (SLOT_SIZE - ICON_SIZE) / 2.0f;
+                    float y_pos = 10.0f + (SLOT_SIZE - ICON_SIZE) / 2.0f;
+
+                    uint8_t blockID = g_inventory[i].itemID;
+                    float iconIndex = 0.0f;
+                    if (blockID == BLOCK_ID_GRASS) iconIndex = 0.0f;
+                    else if (blockID == BLOCK_ID_DIRT) iconIndex = 1.0f;
+                    else if (blockID == BLOCK_ID_STONE) iconIndex = 2.0f;
+                    else if (blockID == BLOCK_ID_WATER) iconIndex = 3.0f;
+                    else if (blockID == BLOCK_ID_SAND ) iconIndex = 4.0f;
+                    else if (blockID == BLOCK_ID_SANDSTONE) iconIndex = 5.0f;
+                    else if (blockID == BLOCK_ID_SNOW) iconIndex = 6.0f;
+                    else if (blockID == BLOCK_ID_ICE) iconIndex = 7.0f;
+                    else if (blockID == BLOCK_ID_BEDROCK) iconIndex = 8.0f;
+                    else if (blockID == BLOCK_ID_TORCH) iconIndex = 9.0f;
+                    else if (blockID == BLOCK_ID_LOG) iconIndex = 10.0f;
+                    else if (blockID == BLOCK_ID_LEAVES) iconIndex = 11.0f;
+                    else if (blockID == ITEM_ID_PICKAXE) iconIndex = 12.0f; // Np. 13. ikona
+                    else if (blockID == BLOCK_ID_COAL_ORE)    iconIndex = 13.0f;
+                    else if (blockID == BLOCK_ID_IRON_ORE)    iconIndex = 14.0f;
+                    else if (blockID == BLOCK_ID_GOLD_ORE)    iconIndex = 15.0f;
+                    else if (blockID == BLOCK_ID_DIAMOND_ORE) iconIndex = 16.0f;
+
+                    glm::vec2 uvOffset(iconIndex / ICON_ATLAS_COLS, 0.0f);
+                    uiShader.setVec2("u_uvOffset", uvOffset);
+
+                    // Ręczne rysowanie ikony
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D, iconsTextureID);
+                    glm::mat4 model = glm::mat4(1.0f);
+                    model = glm::translate(model, glm::vec3(x_pos, y_pos, 0.0f));
+                    model = glm::scale(model, glm::vec3(ICON_SIZE, ICON_SIZE, 1.0f));
+                    uiShader.setMat4("model", model);
+
+                    if (blockID != BLOCK_ID_AIR) {
+                        glDrawArrays(GL_TRIANGLES, 0, 6);
+                    }
+                    if (g_inventory[i].maxDurability > 0) {
+                        DrawDurabilityBar(uiShader, hotbarVAO, x_pos, y_pos, SLOT_SIZE, SLOT_SIZE,
+                                          g_inventory[i].durability, g_inventory[i].maxDurability);
+                    }
+                    else if (g_inventory[i].count > 1) {
+                        std::string countStr = std::to_string(g_inventory[i].count);
+                        float FONT_SIZE = 16.0f;
+                        float textX = x_pos + ICON_SIZE - (countStr.length() * FONT_SIZE * 0.6f) - 2.0f;
+                        float textY = y_pos + 2.0f;
+
+                        RenderText(uiShader, hotbarVAO, countStr, textX, textY, FONT_SIZE);
+
+                        // Resetuj stan dla następnej iteracji
+                        glActiveTexture(GL_TEXTURE0);
+                        glBindTexture(GL_TEXTURE_2D, iconsTextureID);
+                        uiShader.setVec2("u_uvScale", 1.0f / ICON_ATLAS_COLS, 1.0f / ICON_ATLAS_ROWS);
+                    }
+                }
+
+                // Rysuj selektor
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, selectorTextureID);
+                uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+                uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+                float selector_x_pos = BAR_START_X + g_activeSlot * (SLOT_SIZE + GAP) - (SELECTOR_SIZE - SLOT_SIZE) / 2.0f;
+                float selector_y_pos = 10.0f - (SELECTOR_SIZE - SLOT_SIZE) / 2.0f;
+                glm::mat4 model = glm::mat4(1.0f);
+                model = glm::translate(model, glm::vec3(selector_x_pos, selector_y_pos, 0.0f));
+                model = glm::scale(model, glm::vec3(SELECTOR_SIZE, SELECTOR_SIZE, 1.0f));
+                uiShader.setMat4("model", model);
+                glDrawArrays(GL_TRIANGLES, 0, 6);
+            }
+            if (g_mouseItem.itemID != BLOCK_ID_AIR)
+            {
+                double mx, my;
+                glfwGetCursorPos(window, &mx, &my);
+
+                // Konwertuj współrzędne myszy na UI (od dołu)
+                float mouseX = static_cast<float>(mx);
+                float mouseY = SCR_HEIGHT - static_cast<float>(my);
+
+                // Wyśrodkuj ikonę na kursorze
+                float iconSize = 52.0f;
+                float drawX = mouseX - iconSize / 2.0f;
+                float drawY = mouseY - iconSize / 2.0f;
+
+                // Ustaw teksturę ikon
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, iconsTextureID);
+                uiShader.setVec2("u_uvScale", 1.0f / ICON_ATLAS_COLS, 1.0f / ICON_ATLAS_ROWS);
+
+                // Znajdź UV dla przedmiotu
+                uint8_t heldID = g_mouseItem.itemID;
+                float iconIndex = 0.0f;
+                if (heldID == BLOCK_ID_GRASS) iconIndex = 0.0f;
+                else if (heldID == BLOCK_ID_DIRT) iconIndex = 1.0f;
+                // ... (dodaj mapowania, lub lepiej: zrób funkcję pomocniczą GetIconIndex(id)) ...
+                // Na razie skopiuj logikę mapowania stąd, co masz wyżej w pętlach:
+                else if (heldID == BLOCK_ID_STONE) iconIndex = 2.0f;
+                else if (heldID == BLOCK_ID_WATER) iconIndex = 3.0f;
+                else if (heldID == BLOCK_ID_SAND ) iconIndex = 4.0f;
+                else if (heldID == BLOCK_ID_SANDSTONE) iconIndex = 5.0f;
+                else if (heldID == BLOCK_ID_SNOW) iconIndex = 6.0f;
+                else if (heldID == BLOCK_ID_ICE) iconIndex = 7.0f;
+                else if (heldID == BLOCK_ID_BEDROCK) iconIndex = 8.0f;
+                else if (heldID == BLOCK_ID_TORCH) iconIndex = 9.0f;
+                else if (heldID == BLOCK_ID_LOG) iconIndex = 10.0f;
+                else if (heldID == BLOCK_ID_LEAVES) iconIndex = 11.0f;
+                else if (heldID == ITEM_ID_PICKAXE) iconIndex = 12.0f; // Np. 13. ikona
+                else if (heldID == BLOCK_ID_COAL_ORE)    iconIndex = 13.0f;
+                else if (heldID == BLOCK_ID_IRON_ORE)    iconIndex = 14.0f;
+                else if (heldID == BLOCK_ID_GOLD_ORE)    iconIndex = 15.0f;
+                else if (heldID == BLOCK_ID_DIAMOND_ORE) iconIndex = 16.0f;
+
+                uiShader.setVec2("u_uvOffset", iconIndex / ICON_ATLAS_COLS, 0.0f);
+
+                // Rysuj (ręcznie, żeby nie psuć stanu)
+                glm::mat4 model = glm::mat4(1.0f);
+                model = glm::translate(model, glm::vec3(drawX, drawY, 0.0f));
+                model = glm::scale(model, glm::vec3(iconSize, iconSize, 1.0f));
+                uiShader.setMat4("model", model);
+                glDrawArrays(GL_TRIANGLES, 0, 6);
+
+                // Rysuj licznik (jeśli > 1)
+                if (g_mouseItem.count > 1) {
+                    std::string countStr = std::to_string(g_mouseItem.count);
+                    RenderText(uiShader, hotbarVAO, countStr, drawX + iconSize - 10, drawY + 2, 16.0f);
+
+                    // Reset po RenderText
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D, iconsTextureID);
+                }
+            }
+            glDisable(GL_BLEND);
+            glEnable(GL_DEPTH_TEST);
+            break;
+        }
+        case STATE_PAUSE_MENU:
+        {
+            // --- KROK 1: NARYSUJ CAŁY ŚWIAT (TAK JAKBY GRA TRWAŁA) ---
+            // (Pełny kod renderowania, skopiowany z STATE_IN_GAME)
+            {
+                // --- NOWA POPRAWKA: Zdefiniuj pozycję gracza ---
+                int playerChunkX = static_cast<int>(floor(camera.Position.x / CHUNK_WIDTH));
+                int playerChunkZ = static_cast<int>(floor(camera.Position.z / CHUNK_DEPTH));
+                // --- KONIEC POPRAWKI ---
+
+                // --- Obliczenia Cyklu Dnia/Nocy ---
+                float dayDuration = 300.0f;
+                float startTimeOffset = dayDuration * 0.3f;
+                float timeOfDay = fmod(glfwGetTime() + startTimeOffset, dayDuration) / dayDuration;
+                float sunAngle = timeOfDay * 2.0f * 3.14159f;
+                glm::vec3 sunDirection = glm::normalize(glm::vec3(sin(sunAngle), cos(sunAngle), 0.3f));
+                float daylightFactor = std::clamp(-sunDirection.y, 0.0f, 1.0f);
+                glm::vec3 daySkyColor = glm::vec3(0.5f, 0.8f, 1.0f);
+                glm::vec3 nightSkyColor = glm::vec3(0.02f, 0.02f, 0.08f);
+                glm::vec3 currentSkyColor = mix(nightSkyColor, daySkyColor, daylightFactor);
+                glm::vec3 sunAmbient = mix(glm::vec3(0.05f), glm::vec3(0.3f), daylightFactor);
+                glm::vec3 sunDiffuse = mix(glm::vec3(0.0f), glm::vec3(0.7f), daylightFactor);
+
+                glClearColor(currentSkyColor.x, currentSkyColor.y, currentSkyColor.z, 1.0f);
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+                // --- Oblicz Macierze ---
+                float viewDistance = (RENDER_DISTANCE + 1) * CHUNK_WIDTH;
+                glm::mat4 projection = glm::perspective(glm::radians(camera.Zoom), (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, viewDistance);
+                glm::mat4 view = camera.GetViewMatrix();
+
+                // --- PRZEBIEG 1: RENDEROWANIE MAPY CIENIA ---
+                {
+                    float shadowRange = 180.0f;
+                    glm::mat4 lightProjection = glm::ortho(-shadowRange, shadowRange, -shadowRange, shadowRange, 1.0f, 150.0f);
+                    glm::vec3 lightCamPos = camera.Position - (sunDirection * 50.0f);
+                    glm::mat4 lightView = glm::lookAt(lightCamPos, camera.Position, glm::vec3(0.0, 1.0, 0.0));
+                    glm::mat4 lightSpaceMatrix = lightProjection * lightView;
+
+                    depthShader.use();
+                    depthShader.setMat4("lightSpaceMatrix", lightSpaceMatrix);
+
+                    glViewport(0, 0, SHADOW_WIDTH, SHADOW_HEIGHT);
+                    glBindFramebuffer(GL_FRAMEBUFFER, shadowMapFBO);
+                    glClear(GL_DEPTH_BUFFER_BIT);
+                    glCullFace(GL_FRONT);
+
+                    for (int x = playerChunkX - RENDER_DISTANCE; x <= playerChunkX + RENDER_DISTANCE; x++) {
+                        for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
+                            auto it = g_WorldChunks.find(glm::ivec2(x, z));
+                            if (it != g_WorldChunks.end()) {
+                                it->second->DrawSolid(depthShader, textureAtlas);
+                            }
+                        }
+                    }
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                    glCullFace(GL_BACK);
+                }
+
+                // --- PRZEBIEG 2: NORMALNE RENDEROWANIE ---
+                glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
+
+                // --- PRZEBIEG 2A: SKYBOX ---
+                if (cubemapTexture != 0)
+                {
+                    glDepthFunc(GL_LEQUAL);
+                    skyboxShader.use();
+                    skyboxShader.setMat4("projection", projection);
+                    skyboxShader.setMat4("view", glm::mat4(glm::mat3(view)));
+                    glBindVertexArray(skyboxVAO);
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_CUBE_MAP, cubemapTexture);
+                    glDrawArrays(GL_TRIANGLES, 0, 36);
+                    glBindVertexArray(0);
+                    glDepthFunc(GL_LESS);
+                }
+
+                // --- PRZEBIEG 2B: ŚWIAT (SOLID) ---
+                ourShader.use();
+                ourShader.setMat4("projection", projection);
+                ourShader.setMat4("view", view);
+                ourShader.setVec3("viewPos", camera.Position);
+                ourShader.setVec3("u_fogColor", currentSkyColor);
+                ourShader.setFloat("u_fogStart", (RENDER_DISTANCE - 2) * CHUNK_WIDTH);
+                ourShader.setFloat("u_fogEnd", (RENDER_DISTANCE + 1) * CHUNK_WIDTH);
+                ourShader.setVec3("u_dirLight.direction", sunDirection);
+                ourShader.setVec3("u_dirLight.ambient", sunAmbient);
+                ourShader.setVec3("u_dirLight.diffuse", sunDiffuse);
+                ourShader.setVec3("u_dirLight.specular", 0.5f, 0.5f, 0.5f);
+
+                int lightCount = 0;
+                for (const auto& torchPos : g_torchPositions)
+                {
+                    if (lightCount >= MAX_POINT_LIGHTS) break;
+                    std::string base = "u_pointLights[" + std::to_string(lightCount) + "]";
+                    ourShader.setVec3(base + ".position", torchPos);
+                    ourShader.setVec3(base + ".ambient", 0.05f, 0.02f, 0.0f);
+                    ourShader.setVec3(base + ".diffuse", 2.0f, 1.2f, 0.4f);
+                    ourShader.setVec3(base + ".specular", 2.0f, 1.2f, 0.4f);
+                    ourShader.setFloat(base + ".constant", 1.0f);
+                    ourShader.setFloat(base + ".linear", 0.06f);
+                    ourShader.setFloat(base + ".quadratic", 0.015f);
+                    lightCount++;
+                }
+                ourShader.setInt("u_pointLightCount", lightCount);
+
+                float shadowRange = 180.0f;
+                glm::mat4 lightProjection = glm::ortho(-shadowRange, shadowRange, -shadowRange, shadowRange, 1.0f, 150.0f);
+                glm::vec3 lightCamPos = camera.Position - (sunDirection * 50.0f);
+                glm::mat4 lightView = glm::lookAt(lightCamPos, camera.Position, glm::vec3(0.0, 1.0, 0.0));
+                glm::mat4 lightSpaceMatrix = lightProjection * lightView;
+                ourShader.setMat4("lightSpaceMatrix", lightSpaceMatrix);
+
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, shadowMapTexture);
+
+                glDepthMask(GL_TRUE);
+                glEnable(GL_CULL_FACE);
+                for (int x = playerChunkX - RENDER_DISTANCE; x <= playerChunkX + RENDER_DISTANCE; x++) {
+                    for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
+                        auto it = g_WorldChunks.find(glm::ivec2(x, z));
+                        if (it != g_WorldChunks.end()) {
+                            it->second->DrawSolid(ourShader, textureAtlas);
+                        }
+                    }
+                }
+
+                // --- PRZEBIEG 2C: LIŚCIE I POCHODNIE ---
+                ourShader.use();
+                glDepthMask(GL_TRUE);
+                glDisable(GL_CULL_FACE);
+                for (int x = playerChunkX - RENDER_DISTANCE; x <= playerChunkX + RENDER_DISTANCE; x++) {
+                    for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
+                        auto it = g_WorldChunks.find(glm::ivec2(x, z));
+                        if (it != g_WorldChunks.end()) {
+                            it->second->DrawFoliage(ourShader, textureAtlas);
+                        }
+                    }
+                }
+
+                // (Nie rysujemy podświetlenia w menu pauzy)
+
+                // --- PRZEBIEG 2E: WODA (SORTOWANA) ---
+                ourShader.use();
+                glDepthMask(GL_FALSE);
+                glEnable(GL_BLEND);
+                // glDisable(GL_CULL_FACE); // Już wyłączone z przebiegu 2C
+
+                std::map<float, Chunk*, std::greater<float>> sortedChunks;
+                for (int x = playerChunkX - RENDER_DISTANCE; x <= playerChunkX + RENDER_DISTANCE; x++) {
+                    for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
+                        auto it = g_WorldChunks.find(glm::ivec2(x, z));
+                        if (it != g_WorldChunks.end()) {
+                            Chunk* chunk = it->second;
+                            glm::vec3 chunkCenter = chunk->position + glm::vec3(CHUNK_WIDTH / 2.0f, CHUNK_HEIGHT / 2.0f, CHUNK_DEPTH / 2.0f);
+                            glm::vec3 vecToChunk = camera.Position - chunkCenter;
+                            float distanceSq = glm::dot(vecToChunk, vecToChunk);
+                            sortedChunks[distanceSq] = chunk;
+                        }
+                    }
+                }
+                for (auto const& [dist, chunk] : sortedChunks)
+                {
+                    chunk->DrawTransparent(ourShader, textureAtlas);
+                }
+
+                glEnable(GL_CULL_FACE);
+                glDepthMask(GL_TRUE);
+
+                // --- KROK 1.5: Rysuj Hotbar (w tle menu pauzy) ---
+                // (Ten kod jest skopiowany z 'STATE_IN_GAME', aby hotbar był widoczny)
+                {
+                    glDisable(GL_DEPTH_TEST);
+                    glDisable(GL_CULL_FACE);
+                    uiShader.use();
+                    uiShader.setMat4("projection", ortho_projection);
+                    uiShader.setFloat("u_opacity", 1.0f);
+                    glBindVertexArray(hotbarVAO);
+
+                    // 1. Tła slotów
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D, slotTextureID);
+                    uiShader.setInt("uiTexture", 0);
+                    uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+                    uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+                    for (int i = 0; i < HOTBAR_SIZE; i++) {
+                        float x_pos = BAR_START_X + i * (SLOT_SIZE + GAP);
+                        float y_pos = 10.0f;
+                        DrawMenuButton(uiShader, hotbarVAO, slotTextureID, x_pos, y_pos, SLOT_SIZE, SLOT_SIZE);
+                    }
+
+                    // 2. Ikony
+                    float ICON_SIZE = 52.0f;
+                    glm::vec2 uvScale(1.0f / ICON_ATLAS_COLS, 1.0f / ICON_ATLAS_ROWS);
+                    uiShader.setVec2("u_uvScale", uvScale);
+                    for (int i = 0; i < HOTBAR_SIZE; i++) {
+                        float x_pos = BAR_START_X + i * (SLOT_SIZE + GAP) + (ICON_SIZE - SLOT_SIZE) / 2.0f;
+                        float y_pos = 10.0f + (ICON_SIZE - SLOT_SIZE) / 2.0f;
+                        glm::mat4 model = glm::mat4(1.0f);
+                        model = glm::translate(model, glm::vec3(x_pos, y_pos, 0.0f));
+                        model = glm::scale(model, glm::vec3(ICON_SIZE, ICON_SIZE, 1.0f));
+                        uiShader.setMat4("model", model);
+
+                        uint8_t blockID = g_inventory[i].itemID;
+                        float iconIndex = 0.0f;
+                        if (blockID == BLOCK_ID_GRASS) iconIndex = 0.0f;
+                        else if (blockID == BLOCK_ID_DIRT) iconIndex = 1.0f;
+                        else if (blockID == BLOCK_ID_STONE) iconIndex = 2.0f;
+                        else if (blockID == BLOCK_ID_WATER) iconIndex = 3.0f;
+                        else if (blockID == BLOCK_ID_SAND ) iconIndex = 5.0f;
+                        else if (blockID == BLOCK_ID_SANDSTONE) iconIndex = 6.0f;
+                        else if (blockID == BLOCK_ID_SNOW) iconIndex = 7.0f;
+                        else if (blockID == BLOCK_ID_ICE) iconIndex = 8.0f;
+                        else if (blockID == BLOCK_ID_BEDROCK) iconIndex = 4.0f;
+                        else if (blockID == BLOCK_ID_TORCH) iconIndex = 9.0f;
+                        else if (blockID == BLOCK_ID_LOG) iconIndex = 10.0f;
+                        else if (blockID == BLOCK_ID_LEAVES) iconIndex = 11.0f;
+                        else if (blockID == ITEM_ID_PICKAXE) iconIndex = 12.0f; // Np. 13. ikona
+                        else if (blockID == BLOCK_ID_COAL_ORE)    iconIndex = 13.0f;
+                        else if (blockID == BLOCK_ID_IRON_ORE)    iconIndex = 14.0f;
+                        else if (blockID == BLOCK_ID_GOLD_ORE)    iconIndex = 15.0f;
+                        else if (blockID == BLOCK_ID_DIAMOND_ORE) iconIndex = 16.0f;
+
+                        glm::vec2 uvOffset(iconIndex / ICON_ATLAS_COLS, 0.0f);
+                        uiShader.setVec2("u_uvOffset", uvOffset);
+
+                        glBindTexture(GL_TEXTURE_2D, iconsTextureID);
+                        if (blockID != BLOCK_ID_AIR) {
+                            glDrawArrays(GL_TRIANGLES, 0, 6);
+                        }
+                        if (g_inventory[i].maxDurability > 0) {
+                            DrawDurabilityBar(uiShader, hotbarVAO, x_pos, y_pos, SLOT_SIZE, SLOT_SIZE,
+                                              g_inventory[i].durability, g_inventory[i].maxDurability);
+                        }
+                        else if (g_inventory[i].count > 1) {
+                            std::string countStr = std::to_string(g_inventory[i].count);
+                            float FONT_SIZE = 16.0f;
+                            float textX = x_pos + ICON_SIZE - (countStr.length() * FONT_SIZE * 0.6f) - 2.0f;
+                            float textY = y_pos + 2.0f;
+                            glEnable(GL_BLEND);
+                            RenderText(uiShader, hotbarVAO, countStr, textX, textY, FONT_SIZE);
+                            glDisable(GL_BLEND);
+                            glActiveTexture(GL_TEXTURE0);
+                            glBindTexture(GL_TEXTURE_2D, iconsTextureID);
+                            uiShader.setVec2("u_uvScale", 1.0f / ICON_ATLAS_COLS, 1.0f / ICON_ATLAS_ROWS);
+                        }
+                    }
+
+                    // 3. Selektor
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D, selectorTextureID);
+                    uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+                    uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+                    float selector_x_pos = BAR_START_X + g_activeSlot * (SLOT_SIZE + GAP) - (SELECTOR_SIZE - SLOT_SIZE) / 2.0f;
+                    float selector_y_pos = 10.0f - (SELECTOR_SIZE - SLOT_SIZE) / 2.0f;
+                    glm::mat4 model = glm::mat4(1.0f);
+                    model = glm::translate(model, glm::vec3(selector_x_pos, selector_y_pos, 0.0f));
+                    model = glm::scale(model, glm::vec3(SELECTOR_SIZE, SELECTOR_SIZE, 1.0f));
+                    uiShader.setMat4("model", model);
+                    glDrawArrays(GL_TRIANGLES, 0, 6);
+                    glBindVertexArray(0);
+                }
+            } // Koniec bloku renderowania tła 3D i hotbara
+
+
+            // --- KROK 2: NARYSUJ PÓŁPRZEZROCZYSTĄ NAKŁADKĘ ---
+            glDisable(GL_DEPTH_TEST);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+            uiShader.use();
+            uiShader.setMat4("projection", ortho_projection);
+            uiShader.setFloat("u_opacity", 0.77f);
+            uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+            uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+
+            DrawMenuButton(uiShader, hotbarVAO, texOverlay, 0.0f, 0.0f, SCR_WIDTH, SCR_HEIGHT);
+
+            // --- KROK 3: NARYSUJ PRZYCISKI MENU PAUZY ---
+            uiShader.setFloat("u_opacity", 1.0f);
+
+            DrawMenuButton(uiShader, hotbarVAO, texBtnResume, BTN_X, PAUSE_BTN_Y_RESUME, BTN_W, BTN_H);
+            DrawMenuButton(uiShader, hotbarVAO, texBtnSaveAndMenu, BTN_X, PAUSE_BTN_Y_MENU, BTN_W, BTN_H);
+            DrawMenuButton(uiShader, hotbarVAO, texBtnQuit, BTN_X, PAUSE_BTN_Y_QUIT, BTN_W, BTN_H);
+
+            glDisable(GL_BLEND);
+            glEnable(GL_DEPTH_TEST);
+            glEnable(GL_CULL_FACE);
+            glDepthMask(GL_TRUE);
+            break;
+        }
         case STATE_EXITING:
             // Pętla się zakończy
             break;
     }
+
 
     // Wspólne dla wszystkich stanów
     glfwSwapBuffers(window);
@@ -1173,11 +3092,7 @@ int main()
     // --- 6. Sprzątanie ---
     // Destruktory chunków (`~Chunk()`) zostaną wywołane automatycznie
     // gdy wektor 'chunks' wyjdzie poza zakres.
-    std::cout << "Zapisywanie swiata..." << std::endl;
-    for (auto& chunk : chunk_storage) // Użyj chunk_storage, a nie g_WorldChunks
-    {
-        chunk.SaveToFile();
-    }
+    SaveWorld();
     std::cout << "Zapisano." << std::endl;
     // --- KONIEC NOWOŚCI ---
     glDeleteProgram(ourShader.ID);
@@ -1186,31 +3101,86 @@ int main()
     glDeleteBuffers(1, &crosshairVBO); // <<< NOWOŚĆ
     glDeleteVertexArrays(1, &highlighterVAO); // <<< NOWOŚĆ
     glDeleteBuffers(1, &highlighterVBO);
+    ma_engine_uninit(&g_audioEngine);
     glfwTerminate();
     return 0;
 }
 
 void processInput(GLFWwindow *window)
 {
+    if (isDead) return;
     static bool f_pressed = false;
+    static bool esc_pressed_last_frame = false; // <<< NOWA ZMIENNA ŚLEDZĄCA
+    static bool e_pressed_last_frame = false; // <<< NOWA ZMIENNA ŚLEDZĄCA
+
+    // --- OBSŁUGA KLAWISZA ESCAPE (Działa zawsze) ---
+
+    bool esc_is_pressed_now = (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS);
+
+    // SPRAWDŹ, CZY KLAWISZ ZOSTAŁ WŁAŚNIE WCIŚNIĘTY (a nie był trzymany)
+    if (esc_is_pressed_now && !esc_pressed_last_frame)
+    {
+        if (g_currentState == STATE_IN_GAME) {
+
+            // PRZEJŚCIE DO MENU PAUZY
+            g_currentState = STATE_PAUSE_MENU;
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+            wishDir = glm::vec3(0.0f);
+            wishJump = false;
+        }
+        else if (g_currentState == STATE_PAUSE_MENU) {
+            // WYJŚCIE Z MENU PAUZY
+            g_currentState = STATE_IN_GAME;
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+            firstMouse = true;
+        }
+    }
+
+    // Zaktualizuj stan na następną klatkę
+    esc_pressed_last_frame = esc_is_pressed_now;
+    static bool m_pressed = false;
+    if (glfwGetKey(window, GLFW_KEY_M) == GLFW_PRESS) {
+        if (!m_pressed) {
+            glm::vec3 spawnPos = camera.Position + (camera.Front * 3.0f); // 3 metry przed graczem
+            SpawnEntity(spawnPos);
+            std::cout << "Zespawnowano Swinke!" << std::endl;
+            m_pressed = true;
+        }
+    } else { m_pressed = false; }
+    // --- KONIEC OBSŁUGI ESCAPE ---
+    bool e_is_pressed_now = (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS);
+    if (e_is_pressed_now && !e_pressed_last_frame)
+    {
+        if (g_currentState == STATE_IN_GAME) {
+
+            g_currentState = STATE_INVENTORY;
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+            wishDir = glm::vec3(0.0f);
+            wishJump = false;
+        }
+        else if (g_currentState == STATE_INVENTORY) {
+            g_currentState = STATE_IN_GAME;
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+            firstMouse = true;
+        }
+    }
+    e_pressed_last_frame = e_is_pressed_now;
+
+    // --- OBSŁUGA RUCHU (Działa tylko w grze) ---
+    if (g_currentState != STATE_IN_GAME)
+    {
+        return; // Jesteśmy w menu, nie przetwarzaj ruchu
+    }
+
     // ... (obsługa klawiszy numerycznych Hotbara bez zmian) ...
     for (int i = 0; i < HOTBAR_SIZE; i++) {
         if (glfwGetKey(window, GLFW_KEY_1 + i) == GLFW_PRESS) {
             g_activeSlot = i;
-            g_selectedBlockID = g_hotbarSlots[i];
+            g_selectedBlockID = g_inventory[i].itemID;
             break;
         }
     }
 
-    // Zamknięcie okna
-    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
-        if (g_currentState == STATE_IN_GAME) {
-            g_currentState = STATE_MAIN_MENU; // Wróć do menu
-            // Musimy zresetować stan, aby nie iść w kierunku po powrocie do gry
-            wishDir = glm::vec3(0.0f);
-            wishJump = false;
-        }
-    }
     // Przełącznik trybu Latanie/Chodzenie
     if (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS) {
         if (!f_pressed) {
@@ -1223,7 +3193,25 @@ void processInput(GLFWwindow *window)
     if (glfwGetKey(window, GLFW_KEY_F) == GLFW_RELEASE) {
         f_pressed = false;
     }
+    static bool q_pressed = false;
+    if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) {
+        if (!q_pressed) {
+            // Sprawdź czy mamy przedmiot w ręce
+            if (g_inventory[g_activeSlot].itemID != BLOCK_ID_AIR) {
+                // Zmniejsz ilość
+                uint8_t itemID = g_inventory[g_activeSlot].itemID;
+                g_inventory[g_activeSlot].count--;
+                if (g_inventory[g_activeSlot].count <= 0)
+                    g_inventory[g_activeSlot].itemID = BLOCK_ID_AIR;
 
+                // Wyrzuć przed siebie
+                glm::vec3 spawnPos = camera.Position + glm::vec3(0, 1.5f, 0) + (camera.Front * 0.5f);
+                glm::vec3 throwVel = camera.Front * 6.0f; // Mocno do przodu
+                SpawnDrop(itemID, spawnPos, throwVel);
+            }
+            q_pressed = true;
+        }
+    } else { q_pressed = false; }
     // --- Ustawianie "Życzenia" Ruchu (wishDir) ---
     wishDir = glm::vec3(0.0f);
 
@@ -1235,7 +3223,7 @@ void processInput(GLFWwindow *window)
     if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) wishDir -= right_horizontal;
     if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) wishDir += right_horizontal;
 
-    // --- Ruch Pionowy (zależy od trybu) ---
+    // --- Ruch Poziomy (zależy od trybu) ---
     if (camera.flyingMode)
     {
         if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) wishDir += camera.WorldUp;
@@ -1243,16 +3231,13 @@ void processInput(GLFWwindow *window)
     }
     else // Chodzenie lub Pływanie
     {
-        // Skok (lub pływanie w górę)
         if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) {
             wishJump = true;
         } else {
             wishJump = false;
         }
-
-        // POPRAWKA: Pływanie w dół (lub kucanie, gdy je dodamy)
         if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) {
-             wishDir -= camera.WorldUp; // Dodaj składową 'w dół'
+            wishDir -= camera.WorldUp;
         }
     }
 
@@ -1262,11 +3247,19 @@ void processInput(GLFWwindow *window)
 }
 void framebuffer_size_callback(GLFWwindow* window, int width, int height)
 {
+    // Za każdym razem, gdy okno zmieni rozmiar,
+    // przelicz wszystkie pozycje UI i viewport
+    UpdateScreenSize(width, height);
     glViewport(0, 0, width, height);
+    std::cout << "Poprawnie wykonano glViewport" << std::endl;
 }
 
 void mouse_callback(GLFWwindow* window, double xposIn, double yposIn)
 {
+    if (g_currentState != STATE_IN_GAME)
+    {
+        return;
+    }
     float xpos = static_cast<float>(xposIn);
     float ypos = static_cast<float>(yposIn);
     if (firstMouse) { lastX = xpos; lastY = ypos; firstMouse = false; }
@@ -1301,11 +3294,13 @@ bool Raycast(glm::vec3 startPos, glm::vec3 direction, float maxDist, glm::ivec3&
             static_cast<int>(round(currentPos.z))
         );
 
-        // POPRAWKA: Sprawdź, czy blok jest SOLIDNY
         uint8_t block = GetBlockGlobal(blockPos.x, blockPos.y, blockPos.z);
-        if (block != BLOCK_ID_AIR && block != BLOCK_ID_WATER) {
+
+        // POPRAWKA: Zatrzymuj się tylko na blokach, które NIE są powietrzem I NIE są wodą
+        // (Chcemy budować "wewnątrz" wody, więc musimy trafić w dno/ścianę za nią)
+        if (block != BLOCK_ID_AIR && !IsAnyWater(block)) {
             out_hitBlock = blockPos;
-            out_prevBlock = prevBlockPos;
+            out_prevBlock = prevBlockPos; // To będzie pozycja WODY (jeśli celujemy przez wodę)
             return true;
         }
 
@@ -1317,6 +3312,10 @@ bool Raycast(glm::vec3 startPos, glm::vec3 direction, float maxDist, glm::ivec3&
 
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 {
+    if (g_currentState == STATE_IN_GAME) {
+        if (isDead) return; // Nie można budować po śmierci
+        // ...
+    }
     // === OBSŁUGA STANU MENU ===
     if (g_currentState == STATE_MAIN_MENU && button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS)
     {
@@ -1329,16 +3328,17 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
             {
                 // --- NOWY ŚWIAT ---
                 // TODO: W przyszłości zrób tu pole do wpisania nazwy
-                g_inputWorldName = "NowySwiat"; // Ustaw domyślne
+                g_inputWorldName = "New World"; // Ustaw domyślne
                 g_inputSeedString = "";
                 g_activeInput = 0; // Aktywuj pierwsze pole
                 g_currentState = STATE_NEW_WORLD_MENU; // Przejdź do nowego menu
             }
             else if (IsMouseOver(mouseX, mouseY, BTN_X, BTN_Y_LOAD, BTN_W, BTN_H))
             {
-                // --- ZAŁADUJ ŚWIAT ---
-                std::cout << "Wybieranie swiata do wczytania..." << std::endl;
+                // --- WCZYTAJ ŚWIAT ---
+                std::cout << "Otwieranie menu wczytywania swiata..." << std::endl;
 
+                // Wyczyść starą listę i zeskanuj folder 'worlds'
                 existingWorlds.clear();
                 std::string worldsPath = "worlds";
                 if (std::filesystem::exists(worldsPath)) {
@@ -1349,28 +3349,8 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                     }
                 }
 
-                // TODO: Zamiast ładować pierwszy, przełącz na 'currentMenuPage = 1'
-                // i narysuj listę 'existingWorlds'.
-                // Na razie na sztywno ładujemy pierwszy z listy lub stary świat.
-
-                std::string worldToLoad = "MojPierwszySwiat"; // Domyślny
-                if (!existingWorlds.empty()) {
-                     worldToLoad = existingWorlds[0];
-                }
-
-                g_selectedWorldName = worldToLoad;
-                g_selectedWorldSeed = 12345; // Domyślny seed
-
-                std::string infoPath = "worlds/" + g_selectedWorldName + "/world.info";
-                if (std::filesystem::exists(infoPath)) {
-                    std::ifstream infoFile(infoPath);
-                    if (infoFile.is_open()) {
-                        infoFile >> g_selectedWorldSeed; // Wczytaj prawdziwy seed
-                        infoFile.close();
-                    }
-                }
-                std::cout << "Ladowanie swiata: " << g_selectedWorldName << " (Seed: " << g_selectedWorldSeed << ")" << std::endl;
-                g_currentState = STATE_LOADING_WORLD;
+                // Przejdź do nowego stanu (menu wyboru świata)
+                g_currentState = STATE_LOAD_WORLD_MENU;
             }
             else if (IsMouseOver(mouseX, mouseY, BTN_X, BTN_Y_QUIT, BTN_W, BTN_H))
             {
@@ -1397,6 +3377,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
         // Kliknięcie "Start"
         else if (IsMouseOver(mouseX, mouseY, BTN_START_X, BTN_START_Y, BTN_W, BTN_H))
         {
+            // --- POPRAWNA LOGIKA DLA "START" ---
             g_selectedWorldName = g_inputWorldName;
             if (g_selectedWorldName.empty()) g_selectedWorldName = "SwiatBezNazwy";
 
@@ -1407,16 +3388,230 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                 try {
                     g_selectedWorldSeed = std::stoi(g_inputSeedString);
                 } catch (...) {
-                    // Jeśli się nie uda (np. ktoś wpisał "abc"), użyj hasha stringa
                     g_selectedWorldSeed = static_cast<int>(std::hash<std::string>{}(g_inputSeedString));
                 }
             }
             std::cout << "Rozpoczynanie swiata: " << g_selectedWorldName << " (Seed: " << g_selectedWorldSeed << ")" << std::endl;
+
+            // Przejdź do nowego stanu (menu wyboru świata)
             g_currentState = STATE_LOADING_WORLD;
         }
         // Kliknięcie "Wstecz"
         else if (IsMouseOver(mouseX, mouseY, BTN_BACK_X, BTN_BACK_Y, BTN_W, BTN_H)) {
             g_currentState = STATE_MAIN_MENU;
+        }
+        return;
+
+    }
+    else if (g_currentState == STATE_LOAD_WORLD_MENU && button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS)
+    {
+        double mouseX, mouseY;
+        glfwGetCursorPos(window, &mouseX, &mouseY);
+
+        // Sprawdź kliknięcie na przycisk "Wstecz"
+        if (IsMouseOver(mouseX, mouseY, LIST_ITEM_X, LIST_BACK_BTN_Y, LIST_ITEM_W, LIST_ITEM_H)) {
+            g_currentState = STATE_MAIN_MENU;
+            return;
+        }
+
+        // Sprawdź kliknięcie na listę światów
+        float current_y = LIST_START_Y;
+        for (const std::string& worldName : existingWorlds)
+        {
+            if (IsMouseOver(mouseX, mouseY, LIST_ITEM_X, current_y, LIST_ITEM_W, LIST_ITEM_H))
+            {
+                // --- ZNALEŹLIŚMY KLIKNIĘTY ŚWIAT ---
+                g_selectedWorldName = worldName;
+
+                // Spróbuj wczytać seed z pliku world.info
+                g_selectedWorldSeed = 12345; // Domyślny, na wszelki wypadek
+                std::string infoPath = "worlds/" + g_selectedWorldName + "/world.info";
+
+                if (std::filesystem::exists(infoPath)) {
+                    std::ifstream infoFile(infoPath);
+                    if (infoFile.is_open()) {
+                        infoFile >> g_selectedWorldSeed;
+                        infoFile.close();
+                    }
+                }
+
+                std::cout << "Ladowanie swiata: " << g_selectedWorldName << " (Seed: " << g_selectedWorldSeed << ")" << std::endl;
+                g_currentState = STATE_LOADING_WORLD;
+                return; // Zakończ pętlę
+            }
+            current_y -= LIST_GAP; // Przesuń w dół do następnej pozycji
+        }
+        return;
+    }
+    else if (g_currentState == STATE_INVENTORY && action == GLFW_PRESS)
+    {
+        double mouseX, mouseY;
+        glfwGetCursorPos(window, &mouseX, &mouseY);
+        int slotIndex = GetSlotUnderMouse(mouseX, mouseY);
+
+        if (slotIndex != -1)
+        {
+            // 1. Zidentyfikuj, w który slot klikamy (wskaźnik ułatwia sprawę)
+            ItemStack* targetSlot = nullptr;
+
+            if (slotIndex == SLOT_RESULT) {
+                targetSlot = &g_craftingOutput;
+            } else if (slotIndex >= SLOT_CRAFT_START) {
+                targetSlot = &g_craftingGrid[slotIndex - SLOT_CRAFT_START];
+            } else {
+                targetSlot = &g_inventory[slotIndex];
+            }
+
+            // ============================================================
+            // LEWY PRZYCISK MYSZY (LPM) - Standardowe przenoszenie
+            // ============================================================
+            if (button == GLFW_MOUSE_BUTTON_LEFT)
+            {
+                // Specjalna obsługa slotu WYNIKU (Crafting)
+                if (slotIndex == SLOT_RESULT)
+                {
+                    if (targetSlot->itemID != BLOCK_ID_AIR)
+                    {
+                        // Logika Shift+Klik (Craft All)
+                        bool isShiftHeld = (mods & GLFW_MOD_SHIFT);
+
+                        if (isShiftHeld) {
+                            while (targetSlot->itemID != BLOCK_ID_AIR) {
+                                if (!AddItemToInventory(targetSlot->itemID, targetSlot->count)) break;
+                                // Zabierz surowce
+                                for (int i = 0; i < 4; i++) {
+                                    if (g_craftingGrid[i].itemID != BLOCK_ID_AIR) {
+                                        g_craftingGrid[i].count--;
+                                        if (g_craftingGrid[i].count <= 0) g_craftingGrid[i].itemID = BLOCK_ID_AIR;
+                                    }
+                                }
+                                CheckCrafting();
+                            }
+                        }
+                        // Zwykłe podniesienie wyniku
+                        else if (g_mouseItem.itemID == BLOCK_ID_AIR) {
+                            g_mouseItem = *targetSlot;
+                            *targetSlot = {BLOCK_ID_AIR, 0}; // Wizualne czyszczenie
+
+                            // Zabierz surowce
+                            for (int i = 0; i < 4; i++) {
+                                if (g_craftingGrid[i].itemID != BLOCK_ID_AIR) {
+                                    g_craftingGrid[i].count--;
+                                    if (g_craftingGrid[i].count <= 0) g_craftingGrid[i].itemID = BLOCK_ID_AIR;
+                                }
+                            }
+                            CheckCrafting();
+                        }
+                        ma_engine_play_sound(&g_audioEngine, "pop.mp3", NULL);
+                    }
+                }
+                // Obsługa zwykłych slotów (Ekwipunek i Siatka Craftingu)
+                else
+                {
+                    // Mysz pusta -> Podnieś
+                    if (g_mouseItem.itemID == BLOCK_ID_AIR) {
+                        if (targetSlot->itemID != BLOCK_ID_AIR) {
+                            g_mouseItem = *targetSlot;
+                            *targetSlot = {BLOCK_ID_AIR, 0};
+                        }
+                    }
+                    // Mysz pełna -> Połóż / Zamień / Dodaj
+                    else {
+                        if (targetSlot->itemID == BLOCK_ID_AIR) {
+                            *targetSlot = g_mouseItem;
+                            g_mouseItem = {BLOCK_ID_AIR, 0};
+                        } else if (targetSlot->itemID == g_mouseItem.itemID) {
+                            int space = MAX_STACK_SIZE - targetSlot->count;
+                            int toAdd = std::min(space, g_mouseItem.count);
+                            targetSlot->count += toAdd;
+                            g_mouseItem.count -= toAdd;
+                            if (g_mouseItem.count <= 0) g_mouseItem = {BLOCK_ID_AIR, 0};
+                        } else {
+                            ItemStack temp = *targetSlot;
+                            *targetSlot = g_mouseItem;
+                            g_mouseItem = temp;
+                        }
+                    }
+                    CheckCrafting(); // Sprawdź receptury po zmianie
+                }
+            }
+
+            // ============================================================
+            // PRAWY PRZYCISK MYSZY (PPM) - Dzielenie i Stawianie po 1
+            // ============================================================
+            else if (button == GLFW_MOUSE_BUTTON_RIGHT)
+            {
+                // Ignorujemy PPM na slocie wyniku (dla uproszczenia)
+                if (slotIndex == SLOT_RESULT) return;
+
+                // PRZYPADEK 1: Trzymamy przedmiot -> Połóż JEDEN (Place One)
+                if (g_mouseItem.itemID != BLOCK_ID_AIR)
+                {
+                    // A. Slot pusty -> połóż 1 sztukę
+                    if (targetSlot->itemID == BLOCK_ID_AIR) {
+                        targetSlot->itemID = g_mouseItem.itemID;
+                        targetSlot->count = 1;
+                        g_mouseItem.count--;
+                    }
+                    // B. Slot ma ten sam przedmiot -> dodaj 1 sztukę
+                    else if (targetSlot->itemID == g_mouseItem.itemID) {
+                        if (targetSlot->count < MAX_STACK_SIZE) {
+                            targetSlot->count++;
+                            g_mouseItem.count--;
+                        }
+                    }
+                    // C. Inny przedmiot -> Zamień (tak samo jak lewym)
+                    else {
+                        ItemStack temp = *targetSlot;
+                        *targetSlot = g_mouseItem;
+                        g_mouseItem = temp;
+                    }
+
+                    // Czyszczenie myszki jeśli pusta
+                    if (g_mouseItem.count <= 0) g_mouseItem = {BLOCK_ID_AIR, 0};
+                }
+                // PRZYPADEK 2: Mysz pusta -> Weź POŁOWĘ (Split Stack)
+                else if (targetSlot->itemID != BLOCK_ID_AIR)
+                {
+                    // Oblicz połowę (zaokrąglając w górę dla myszki)
+                    int total = targetSlot->count;
+                    int toTake = (total + 1) / 2;
+
+                    g_mouseItem.itemID = targetSlot->itemID;
+                    g_mouseItem.count = toTake;
+
+                    targetSlot->count -= toTake;
+                    if (targetSlot->count <= 0) *targetSlot = {BLOCK_ID_AIR, 0};
+                }
+
+                CheckCrafting(); // Zawsze sprawdzaj receptury po kliknięciu
+            }
+        }
+    }
+    else if (g_currentState == STATE_PAUSE_MENU && button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS)
+    {
+        double mouseX, mouseY;
+        glfwGetCursorPos(window, &mouseX, &mouseY);
+
+        // 1. Przycisk "Wznów Grę"
+        if (IsMouseOver(mouseX, mouseY, BTN_X, PAUSE_BTN_Y_RESUME, BTN_W, BTN_H))
+        {
+            g_currentState = STATE_IN_GAME;
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+            firstMouse = true; // Resetuj myszkę
+        }
+        // 2. Przycisk "Zapisz i wyjdź do Menu"
+        else if (IsMouseOver(mouseX, mouseY, BTN_X, PAUSE_BTN_Y_MENU, BTN_W, BTN_H))
+        {
+            SaveWorld(); // Zapisz świat
+            g_currentState = STATE_MAIN_MENU;
+            // Kursor jest już widoczny, więc nie trzeba go zmieniać
+        }
+        // 3. Przycisk "Wyjdź z Gry"
+        else if (IsMouseOver(mouseX, mouseY, BTN_X, PAUSE_BTN_Y_QUIT, BTN_W, BTN_H))
+        {
+            SaveWorld(); // Zapisz świat
+            g_currentState = STATE_EXITING;
         }
         return;
     }
@@ -1433,26 +3628,60 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
     bool hit = Raycast(eyePos, camera.Front, raycastDistance, hitBlockPos, prevBlockPos);
     g_raycastHit = hit;
 
-    if (hit && action == GLFW_PRESS)
+    if (button == GLFW_MOUSE_BUTTON_LEFT)
     {
-        if (button == GLFW_MOUSE_BUTTON_LEFT)
-        {
-            uint8_t blockToDestroy = GetBlockGlobal(hitBlockPos.x, hitBlockPos.y, hitBlockPos.z);
-            if (blockToDestroy != BLOCK_ID_AIR && blockToDestroy != BLOCK_ID_WATER) {
-                if (blockToDestroy==BLOCK_ID_BEDROCK && camera.flyingMode ) {
-                    SetBlock(hitBlockPos.x, hitBlockPos.y, hitBlockPos.z, BLOCK_ID_AIR);
-                }
-                else if (blockToDestroy!=BLOCK_ID_BEDROCK){
-                    SetBlock(hitBlockPos.x, hitBlockPos.y, hitBlockPos.z, BLOCK_ID_AIR);
-                }
-            }
+        if (action == GLFW_PRESS) {
+            g_isMining = true;       // Zacznij kopać
+            g_miningTimer = 0.0f;    // Resetuj timer
+            if(hit) g_currentMiningPos = hitBlockPos; // Zapisz cel
         }
-        else if (button == GLFW_MOUSE_BUTTON_RIGHT)
+        else if (action == GLFW_RELEASE) {
+            g_isMining = false;      // PRZESTAŃ kopać (To teraz zadziała!)
+            g_miningTimer = 0.0f;
+        }
+    }
+
+    // 2. Obsługa PRAWEGO przycisku (Stawianie - TYLKO PRESS)
+    else if (button == GLFW_MOUSE_BUTTON_RIGHT && action == GLFW_PRESS)
+    {
+        if (hit)
         {
             uint8_t blockToPlaceIn = GetBlockGlobal(prevBlockPos.x, prevBlockPos.y, prevBlockPos.z);
-            if (blockToPlaceIn == BLOCK_ID_AIR || (blockToPlaceIn == BLOCK_ID_WATER && g_selectedBlockID != BLOCK_ID_WATER))
+
+            // POPRAWKA: Pozwól stawiać w Powietrzu LUB w dowolnej Wodzie
+            // (pod warunkiem, że nie stawiamy wody w wodzie, co byłoby dziwne, chyba że to wiadro)
+            bool canPlace = (blockToPlaceIn == BLOCK_ID_AIR) ||
+                            (IsAnyWater(blockToPlaceIn) && g_selectedBlockID != BLOCK_ID_WATER);
+            if (canPlace)
             {
-                SetBlock(prevBlockPos.x, prevBlockPos.y, prevBlockPos.z, g_selectedBlockID);
+                // Sprawdź kolizję z graczem (żeby nie postawić bloku w sobie)
+                // Prosty AABB (Hitbox gracza to około 0.6x1.8)
+                glm::vec3 playerFoot = camera.Position;
+                glm::vec3 playerHead = camera.Position + glm::vec3(0, 1.8f, 0);
+
+                // Środki bloku
+                float bx = (float)prevBlockPos.x + 0.5f;
+                float by = (float)prevBlockPos.y + 0.5f;
+                float bz = (float)prevBlockPos.z + 0.5f;
+
+                // Czy gracz jest wewnątrz tego bloku?
+                bool collision = (abs(playerFoot.x - bx) < 0.8f && abs(playerFoot.y - by) < 1.4f && abs(playerFoot.z - bz) < 0.8f);
+
+                if (!collision || g_selectedBlockID == BLOCK_ID_TORCH) // Pochodnie nie mają kolizji
+                {
+                    SetBlock(prevBlockPos.x, prevBlockPos.y, prevBlockPos.z, g_selectedBlockID);
+                    ma_engine_play_sound(&g_audioEngine, "place.mp3", NULL);
+                    // Dodaj światło dla pochodni
+                    if (g_selectedBlockID == BLOCK_ID_TORCH) {
+                        g_torchPositions.push_back(glm::vec3(prevBlockPos) + glm::vec3(0.0f, 0.2f, 0.0f));
+                    }
+
+                    // Odejmij z ekwipunku (opcjonalne, jeśli chcesz survival)
+                    if (!camera.flyingMode) {
+                        g_inventory[g_activeSlot].count--;
+                        if(g_inventory[g_activeSlot].count <= 0) g_inventory[g_activeSlot].itemID = BLOCK_ID_AIR;
+                    }
+                }
             }
         }
     }
@@ -1470,7 +3699,7 @@ void scroll_callback(GLFWwindow* window, double xoffset, double yoffset)
     }
 
     g_activeSlot = newSlot;
-    g_selectedBlockID = g_hotbarSlots[g_activeSlot];
+    g_selectedBlockID = g_inventory[g_activeSlot].itemID;
 
     std::cout << "Wybrano slot: " << g_activeSlot + 1 << " (Block ID: " << g_selectedBlockID << ")" << std::endl;
 }
@@ -1568,4 +3797,891 @@ void RenderText(Shader& shader, unsigned int vao, const std::string& text,
         // Przesuń kursor w prawo. Możesz dostosować '0.6f', jeśli znaki są zbyt blisko/daleko
         cursor_x += (size * 0.6f);
     }
+}
+void SaveWorld() {
+    std::cout << "Zapisywanie swiata..." << std::endl;
+    for (auto& chunk : chunk_storage) // Użyj chunk_storage
+    {
+        chunk.SaveToFile();
+    }
+    SaveInventory();
+    SavePlayerPosition();
+    std::cout << "Zapisano." << std::endl;
+
+    // BARDZO WAŻNE: Wyczyść stary świat, aby zrobić miejsce na nowy,
+    // jeśli gracz wróci do menu głównego.
+    g_WorldChunks.clear();
+    chunk_storage.clear();
+}
+void UpdateScreenSize(int width, int height)
+{
+    // 1. Zaktualizuj globalne zmienne rozmiaru
+    SCR_WIDTH = width;
+    SCR_HEIGHT = height;
+
+    // 2. Zaktualizuj pozycje myszy (aby uniknąć skoków)
+    lastX = SCR_WIDTH / 2.0f;
+    lastY = SCR_HEIGHT / 2.0f;
+    firstMouse = true; // Wymuś reset myszy
+
+    // 3. Oblicz ponownie wszystkie pozycje UI
+    BTN_X = (SCR_WIDTH - BTN_W) / 2.0f;
+    BTN_Y_NEW = SCR_HEIGHT / 2.0f + 70.0f;
+    BTN_Y_LOAD = SCR_HEIGHT / 2.0f;
+    BTN_Y_QUIT = SCR_HEIGHT / 2.0f - 70.0f;
+
+    INPUT_X = (SCR_WIDTH - INPUT_W) / 2.0f;
+    INPUT_NAME_Y = SCR_HEIGHT / 2.0f + 60.0f;
+    INPUT_SEED_Y = SCR_HEIGHT / 2.0f;
+
+    BTN_START_X = (SCR_WIDTH - BTN_W) / 2.0f;
+    BTN_START_Y = SCR_HEIGHT / 2.0f - 70.0f;
+    BTN_BACK_X = (SCR_WIDTH - BTN_W) / 2.0f;
+    BTN_BACK_Y = SCR_HEIGHT / 2.0f - 140.0f;
+
+    LIST_ITEM_X = (SCR_WIDTH - LIST_ITEM_W) / 2.0f;
+    LIST_START_Y = SCR_HEIGHT - 150.0f;
+    LIST_BACK_BTN_Y = 50.0f;
+
+    PAUSE_BTN_Y_RESUME = SCR_HEIGHT / 2.0f + 70.0f;
+    PAUSE_BTN_Y_MENU = SCR_HEIGHT / 2.0f;
+    PAUSE_BTN_Y_QUIT = SCR_HEIGHT / 2.0f - 70.0f;
+
+    BAR_START_X = (SCR_WIDTH - BAR_WIDTH) / 2.0f; // <-- WAŻNE: Dodaj też to
+
+    // 4. Zaktualizuj macierz projekcji 2D
+    ortho_projection = glm::ortho(0.0f, (float)SCR_WIDTH, 0.0f, (float)SCR_HEIGHT);
+    std::cout <<"Dzialanie UpdateScreenSize" << std::endl;
+    // 5. Zaktualizuj viewport OpenGL
+    // glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
+    std::cout << "Poprawnie wykonano glViewport" << std::endl;
+}
+// Zmodyfikowana funkcja: zwraca 'true', jeśli udało się dodać CAŁOŚĆ
+bool AddItemToInventory(uint8_t itemID, int count)
+{
+    // 1. Najpierw spróbuj dodać do istniejących stosów
+    for (int i = 0; i < INVENTORY_SLOTS; i++) {
+        if (g_inventory[i].itemID == itemID && g_inventory[i].count < MAX_STACK_SIZE) {
+            int space = MAX_STACK_SIZE - g_inventory[i].count;
+            int toAdd = std::min(space, count);
+
+            g_inventory[i].count += toAdd;
+            count -= toAdd;
+
+            if (count == 0) return true; // Wszystko dodano
+        }
+    }
+
+    // 2. Jeśli nadal coś zostało, szukaj pustych slotów
+    while (count > 0) {
+        int emptySlot = -1;
+        for (int i = 0; i < INVENTORY_SLOTS; i++) {
+            if (g_inventory[i].itemID == BLOCK_ID_AIR) {
+                emptySlot = i;
+                break;
+            }
+        }
+
+        if (emptySlot != -1) {
+            g_inventory[emptySlot].itemID = itemID;
+            int toAdd = std::min(MAX_STACK_SIZE, count);
+            g_inventory[emptySlot].count = toAdd;
+            count -= toAdd;
+        } else {
+            // Brak miejsca w ekwipunku!
+            // (Opcjonalnie: tutaj można by wyrzucić resztę na ziemię jako drop)
+            return false;
+        }
+    }
+
+    return true;
+}
+int GetSlotUnderMouse(double mouseX, double mouseY) {
+    // Definicje muszą być IDENTYCZNE jak w pętli rysowania (STATE_INVENTORY)
+    float invSlotSize = SLOT_SIZE;
+    float invSlotGap = 4.0f;
+    float invWidth = (invSlotSize * 9) + (invSlotGap * 8);
+    float invStartX = (SCR_WIDTH - invWidth) / 2.0f;
+    float invStartY = (SCR_HEIGHT / 2.0f) - 50.0f;
+
+    // Sprawdź sloty PLECAKA (indeksy 9-35)
+    for (int i = 0; i < 27; i++) {
+        int row = i / 9;
+        int col = i % 9;
+        int slotIndex = i + 9;
+
+        float x = invStartX + col * (invSlotSize + invSlotGap);
+        float y = invStartY - row * (invSlotSize + invSlotGap);
+
+        if (IsMouseOver(mouseX, mouseY, x, y, invSlotSize, invSlotSize)) {
+            return slotIndex;
+        }
+    }
+
+    // Sprawdź sloty HOTBARA (indeksy 0-8)
+    // (Hotbar w inventory jest rysowany w tym samym miejscu co w grze)
+    for (int i = 0; i < HOTBAR_SIZE; i++) {
+        float x = BAR_START_X + i * (SLOT_SIZE + GAP);
+        float y = 10.0f;
+
+        if (IsMouseOver(mouseX, mouseY, x, y, SLOT_SIZE, SLOT_SIZE)) {
+            return i;
+        }
+    }
+    float craftStartX = invStartX + (invSlotSize + invSlotGap) * 5.0f; // Przesuń w prawo
+    float craftStartY = invStartY + (invSlotSize + invSlotGap) * 4.0f; // Przesuń w górę
+
+    // Siatka 2x2 (Input)
+    for (int i = 0; i < 4; i++) {
+        int row = i / 2; // 0 lub 1
+        int col = i % 2; // 0 lub 1
+
+        float x = craftStartX + col * (invSlotSize + invSlotGap);
+        float y = craftStartY - row * (invSlotSize + invSlotGap);
+
+        if (IsMouseOver(mouseX, mouseY, x, y, invSlotSize, invSlotSize)) {
+            return SLOT_CRAFT_START + i; // Zwróć 100, 101, 102 lub 103
+        }
+    }
+
+    // Slot Wyniku (Duży slot po prawej)
+    float resultX = craftStartX + (invSlotSize + invSlotGap) * 3.0f;
+    float resultY = craftStartY - 0.5f * (invSlotSize + invSlotGap); // Wyśrodkowany w pionie
+
+    if (IsMouseOver(mouseX, mouseY, resultX, resultY, invSlotSize, invSlotSize)) {
+        return SLOT_RESULT; // Zwróć 104
+    }
+
+    return -1; // Nie kliknięto w żaden slot
+}
+void SpawnDrop(uint8_t itemID, glm::vec3 pos, glm::vec3 velocity) {
+    if (itemID == BLOCK_ID_AIR) return;
+    DroppedItem item;
+    item.itemID = itemID;
+    item.position = pos;
+    item.velocity = velocity;
+    item.rotationTime = (float)(rand() % 100) / 10.0f; // Losowy start obrotu
+    item.pickupDelay = 1.0f; // Nie można podnieść przez 1 sekundę
+    item.isAlive = true;
+    g_droppedItems.push_back(item);
+}
+void UpdateDrops(float dt, glm::vec3 playerPos) {
+    for (auto it = g_droppedItems.begin(); it != g_droppedItems.end(); ) {
+
+        // 1. Sprawdź, co jest POD przedmiotem
+        int blX = round(it->position.x);
+        int blY_under = floor(it->position.y - 0.25f); // Sprawdź blok pod stopami dropu (0.25 to połowa wysokości dropu)
+        int blZ = round(it->position.z);
+
+        uint8_t blockUnder = GetBlockGlobal(blX, blY_under, blZ);
+        bool isSolidGround = (blockUnder != BLOCK_ID_AIR &&
+                      blockUnder != BLOCK_ID_WATER &&
+                      !(blockUnder == BLOCK_ID_WATER || (blockUnder >= 13 && blockUnder <= 16))&&
+                      blockUnder != BLOCK_ID_TORCH &&
+                      blockUnder != BLOCK_ID_LEAVES);
+
+        // 2. Fizyka Grawitacji
+        if (isSolidGround && it->position.y - (float)blY_under < 1.25f && it->velocity.y <= 0.0f) {
+            // LEŻY NA ZIEMI: Zatrzymaj grawitację
+            it->velocity.y = 0.0f;
+            it->position.y = (float)blY_under + 1.0f+0.2f; // Ustaw idealnie na bloku + mały margines lewitacji
+
+            // Silne tarcie (żeby się nie ślizgał)
+            it->velocity.x *= 0.5f;
+            it->velocity.z *= 0.5f;
+        } else {
+            // JEST W POWIETRZU: Zastosuj grawitację
+            it->velocity.y += GRAVITY * dt;
+
+            // Opór powietrza
+            it->velocity.x *= 0.98f;
+            it->velocity.z *= 0.98f;
+        }
+
+        // 3. Aplikuj ruch
+        it->position += it->velocity * dt;
+
+        // 4. Rotacja (zawsze się kręci dla efektu)
+        it->rotationTime += dt;
+
+        // 5. Zbieranie (Pickup) - BEZ ZMIAN
+        it->pickupDelay -= dt;
+        float distToPlayer = glm::distance(it->position, playerPos + glm::vec3(0,1,0));
+
+        if (distToPlayer < 3.0f && it->pickupDelay <= 0.0f) {
+            glm::vec3 dirToPlayer = normalize((playerPos + glm::vec3(0,1,0)) - it->position);
+            it->position += dirToPlayer * 8.0f * dt; // Szybsze przyciąganie
+        }
+
+        if (distToPlayer < 1.0f && it->pickupDelay <= 0.0f) {
+            if (AddItemToInventory(it->itemID,1)) {
+                ma_engine_play_sound(&g_audioEngine, "pop.mp3", NULL);
+                it = g_droppedItems.erase(it);
+                continue;
+            }
+        }
+
+        ++it;
+    }
+}
+void SpawnBlockParticles(uint8_t blockID, glm::vec3 blockPos) {
+    if (blockID == BLOCK_ID_AIR) return;
+
+    int particleCount = 10; // Ile kawałków wylatuje
+
+    for (int i = 0; i < particleCount; i++) {
+        Particle p;
+        // Losowa pozycja wewnątrz niszczonego bloku
+        float rx = (rand() % 100) / 100.0f;
+        float ry = (rand() % 100) / 100.0f;
+        float rz = (rand() % 100) / 100.0f;
+        p.position = blockPos + glm::vec3(rx, ry, rz);
+
+        // Losowa prędkość (eksplozja we wszystkie strony)
+        float vx = ((rand() % 100) - 50) / 100.0f * 2.0f;
+        float vy = ((rand() % 100) / 100.0f) * 3.0f; // Bardziej w górę
+        float vz = ((rand() % 100) - 50) / 100.0f * 2.0f;
+        p.velocity = glm::vec3(vx, vy, vz);
+
+        p.blockID = blockID;
+        p.lifetime = 0.5f + ((rand() % 100) / 200.0f); // Żyje od 0.5 do 1.0 sekundy
+        p.maxLifetime = p.lifetime;
+
+        g_particles.push_back(p);
+    }
+}
+
+// 2. Funkcja aktualizująca fizykę cząsteczek
+void UpdateParticles(float dt) {
+    for (auto it = g_particles.begin(); it != g_particles.end(); ) {
+        // Grawitacja
+        it->velocity.y += GRAVITY * dt;
+        it->position += it->velocity * dt;
+
+        // Zmniejszanie życia
+        it->lifetime -= dt;
+
+        // Kolizja z podłogą (prosta)
+        if (it->position.y < 0) it->position.y = 0; // Zabezpieczenie przed voidem
+
+        // Usuń martwe cząsteczki
+        if (it->lifetime <= 0.0f) {
+            it = g_particles.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+void UpdateMining(float dt) {
+    if (!g_isMining) return; // Jeśli nie trzymamy przycisku, nic nie rób
+
+    // 1. Sprawdź, w co gracz celuje
+    glm::vec3 eyePos = camera.Position + glm::vec3(0.0f, PLAYER_EYE_HEIGHT, 0.0f);
+    glm::ivec3 hitBlock;
+    glm::ivec3 prevBlock;
+
+    bool hit = Raycast(eyePos, camera.Front, 5.0f, hitBlock, prevBlock);
+
+    if (!hit) { g_miningTimer = 0.0f; return; }
+
+    if (hitBlock != g_currentMiningPos) {
+        g_currentMiningPos = hitBlock;
+        g_miningTimer = 0.0f;
+    }
+
+    uint8_t blockID = GetBlockGlobal(hitBlock.x, hitBlock.y, hitBlock.z);
+
+    // Jeśli w trybie latania (Creative), niszcz natychmiast
+    uint8_t toolID = g_inventory[g_activeSlot].itemID;
+
+    // Oblicz twardość uwzględniając narzędzie
+    float hardness = GetBlockHardness(blockID, toolID);
+    if (camera.flyingMode) hardness = 0.05f;
+
+    if (hardness < 0) return; // Bedrock - niezniszczalny
+
+    // 3. Zwiększ timer
+    g_miningTimer += dt;
+
+    // --- EFEKT WIZUALNY: Generuj trochę cząsteczek PODCZAS kopania ---
+    // (np. co 0.2 sekundy)
+    if (fmod(g_miningTimer, 0.2f) < dt) {
+        // Stwórz 2-3 małe okruszki
+        for(int i=0; i<3; i++) {
+             Particle p;
+             p.position = glm::vec3(hitBlock) + glm::vec3(0.5f) + glm::vec3((rand()%100-50)/100.0f * 0.6f);
+             p.velocity = glm::vec3((rand()%100-50)/200.0f, 0.1f, (rand()%100-50)/200.0f);
+             p.blockID = blockID;
+             p.lifetime = 0.3f;
+             p.maxLifetime = 0.3f;
+             g_particles.push_back(p);
+        }
+    }
+
+    // 4. Sprawdź, czy blok został zniszczony
+    if (g_miningTimer >= hardness) {
+        // === ZNISZCZ BLOK (Kod przeniesiony z mouse_callback) ===
+
+        // 1. Usuń światło (jeśli to pochodnia)
+        if (blockID == BLOCK_ID_TORCH) {
+            g_torchPositions.remove(glm::vec3(hitBlock) + glm::vec3(0.0f, 0.2f, 0.0f));
+        }
+
+        // 2. Usuń blok
+        SetBlock(hitBlock.x, hitBlock.y, hitBlock.z, BLOCK_ID_AIR);
+        ma_engine_play_sound(&g_audioEngine, "break.mp3", NULL);
+        // 3. Efekty (Wybuch + Drop)
+        SpawnBlockParticles(blockID, glm::vec3(hitBlock)); // Duży wybuch
+
+        glm::vec3 randVel = glm::vec3((rand()%10-5)*0.5f, 3.0f, (rand()%10-5)*0.5f);
+        SpawnDrop(blockID, glm::vec3(hitBlock) + 0.5f, randVel);
+        if (toolID == ITEM_ID_PICKAXE && !camera.flyingMode) {
+            g_inventory[g_activeSlot].durability--;
+
+            // Jeśli zniszczony -> usuń
+            if (g_inventory[g_activeSlot].durability <= 0) {
+                g_inventory[g_activeSlot] = {BLOCK_ID_AIR, 0, 0, 0};
+                ma_engine_play_sound(&g_audioEngine, "break.mp3", NULL); // Dźwięk pęknięcia narzędzia
+            }
+        }
+        // 4. Reset
+        g_miningTimer = 0.0f;
+    }
+}
+// --- ZAPISYWANIE EKWIPUNKU ---
+void SaveInventory() {
+    if (g_selectedWorldName.empty()) return;
+
+    std::string path = "worlds/" + g_selectedWorldName + "/inventory.dat";
+    std::ofstream outFile(path, std::ios::binary);
+
+    if (outFile.is_open()) {
+        // Zapisz cały wektor g_inventory naraz (to bezpieczne dla prostych struktur)
+        outFile.write(reinterpret_cast<char*>(g_inventory.data()), g_inventory.size() * sizeof(ItemStack));
+        outFile.close();
+        std::cout << "Zapisano ekwipunek do: " << path << std::endl;
+    } else {
+        std::cout << "BLAD: Nie udalo sie zapisac ekwipunku!" << std::endl;
+    }
+}
+
+// --- WCZYTYWANIE EKWIPUNKU ---
+void LoadInventory() {
+    // 1. Najpierw wyczyść ekwipunek (ustaw startowy zestaw)
+    // Dzięki temu, jeśli to nowy świat, będziesz miał startowe itemy.
+    // A jeśli wczytujesz stary, te itemy zostaną nadpisane z pliku.
+    for (auto& slot : g_inventory) { slot = {BLOCK_ID_AIR, 0}; }
+
+    // Domyślny zestaw startowy (taki sam jak w main)
+    g_inventory[0] = {BLOCK_ID_GRASS, 64};
+    g_inventory[1] = {BLOCK_ID_DIRT, 64};
+    g_inventory[2] = {BLOCK_ID_STONE, 64};
+    g_inventory[3] = {BLOCK_ID_TORCH, 64};
+    g_inventory[4] = {BLOCK_ID_LOG, 64};
+    g_inventory[5] = {BLOCK_ID_LEAVES, 64};
+    g_inventory[6] = {BLOCK_ID_SAND, 64};
+    g_inventory[7] = {BLOCK_ID_WATER, 64};
+    g_inventory[8] = {BLOCK_ID_BEDROCK, 64};
+
+    // 2. Sprawdź, czy plik zapisu istnieje
+    std::string path = "worlds/" + g_selectedWorldName + "/inventory.dat";
+    if (std::filesystem::exists(path)) {
+        std::ifstream inFile(path, std::ios::binary);
+        if (inFile.is_open()) {
+            // Wczytaj dane z pliku, nadpisując zestaw startowy
+            inFile.read(reinterpret_cast<char*>(g_inventory.data()), g_inventory.size() * sizeof(ItemStack));
+            inFile.close();
+            std::cout << "Wczytano ekwipunek z pliku." << std::endl;
+        }
+    } else {
+        std::cout << "Brak pliku ekwipunku - uzywanie zestawu startowego." << std::endl;
+    }
+}
+void SavePlayerPosition() {
+    if (g_selectedWorldName.empty()) return;
+
+    std::string path = "worlds/" + g_selectedWorldName + "/player.dat";
+    std::ofstream outFile(path, std::ios::binary);
+
+    if (outFile.is_open()) {
+        // Zapisz wektor pozycji (X, Y, Z)
+        outFile.write(reinterpret_cast<char*>(&camera.Position), sizeof(glm::vec3));
+
+        // Opcjonalnie: Zapisz też kierunek patrzenia (Yaw, Pitch), jeśli chcesz
+        outFile.write(reinterpret_cast<char*>(&camera.Yaw), sizeof(float));
+        outFile.write(reinterpret_cast<char*>(&camera.Pitch), sizeof(float));
+
+        outFile.close();
+        std::cout << "Zapisano pozycje gracza." << std::endl;
+    }
+}
+
+// --- WCZYTYWANIE POZYCJI GRACZA ---
+void LoadPlayerPosition() {
+    std::string path = "worlds/" + g_selectedWorldName + "/player.dat";
+
+    if (std::filesystem::exists(path)) {
+        std::ifstream inFile(path, std::ios::binary);
+        if (inFile.is_open()) {
+            // Wczytaj pozycję
+            inFile.read(reinterpret_cast<char*>(&camera.Position), sizeof(glm::vec3));
+
+            // Wczytaj kierunek patrzenia
+            inFile.read(reinterpret_cast<char*>(&camera.Yaw), sizeof(float));
+            inFile.read(reinterpret_cast<char*>(&camera.Pitch), sizeof(float));
+
+            // Zaktualizuj wektory kamery (Front, Right, Up) na podstawie nowych Yaw/Pitch
+            // (Zakładam, że masz metodę updateCameraVectors() albo ProcessMouseMovement wywołuje ją)
+            camera.ProcessMouseMovement(0, 0, false); // Trik na odświeżenie wektorów bez ruchu
+
+            inFile.close();
+            std::cout << "Wczytano gracza na: " << camera.Position.x << ", " << camera.Position.y << ", " << camera.Position.z << std::endl;
+        }
+    } else {
+        // Brak zapisu -> Domyślny spawn (wysoko, żeby nie wpaść pod ziemię)
+        camera.Position = glm::vec3(8.0f, 50.0f, 8.0f);
+        camera.Yaw = -90.0f;
+        camera.Pitch = 0.0f;
+        camera.ProcessMouseMovement(0, 0, false);
+        std::cout << "Brak zapisu pozycji - spawn domyslny." << std::endl;
+    }
+}
+void UpdateLiquids(float dt) {
+    g_waterTimer += dt;
+    if (g_waterTimer < 0.10f) return; // Szybciej (co 0.1s) dla płynności
+    g_waterTimer = 0.0f;
+
+    struct BlockChange { glm::ivec3 pos; uint8_t id; };
+    std::vector<BlockChange> changes;
+
+    int radius = 18;
+    glm::ivec3 pPos = glm::ivec3(camera.Position);
+
+    for (int x = pPos.x - radius; x <= pPos.x + radius; x++) {
+        for (int z = pPos.z - radius; z <= pPos.z + radius; z++) {
+            for (int y = 0; y < CHUNK_HEIGHT; y++) {
+
+                uint8_t current = GetBlockGlobal(x, y, z);
+
+                // Sprawdź czy to woda (Źródło lub Płynąca)
+                bool isSource = (current == BLOCK_ID_WATER);
+                bool isFlowing = (current >= BLOCK_ID_WATER_4 && current <= BLOCK_ID_WATER_1);
+
+                if (!isSource && !isFlowing) continue;
+
+                // --- 1. SPADANIE W DÓŁ (Wodospad) ---
+                // Woda spadająca w dół ZAWSZE odzyskuje maksymalną siłę (WATER_4)
+                uint8_t down = GetBlockGlobal(x, y - 1, z);
+                if (down == BLOCK_ID_AIR) {
+                    changes.push_back({ glm::ivec3(x, y - 1, z), BLOCK_ID_WATER_4 });
+                    // Nie rozlewaj się na boki, jeśli spadasz (opcjonalne, ale wygląda lepiej)
+                    continue;
+                }
+                else if (down == BLOCK_ID_WATER || (down >= 13 && down <= 16)) {
+                    // Pod spodem jest woda - traktujemy to jak spadanie
+                    continue;
+                }
+
+                // --- 2. ROZLEWANIE NA BOKI ---
+                // Oblicz siłę nowej wody
+                uint8_t nextID = BLOCK_ID_AIR;
+
+                if (isSource) nextID = BLOCK_ID_WATER_4;      // Źródło -> 4
+                else if (current == BLOCK_ID_WATER_4) nextID = BLOCK_ID_WATER_3;
+                else if (current == BLOCK_ID_WATER_3) nextID = BLOCK_ID_WATER_2;
+                else if (current == BLOCK_ID_WATER_2) nextID = BLOCK_ID_WATER_1;
+                // WATER_1 nie rozlewa się dalej
+
+                if (nextID != BLOCK_ID_AIR) {
+                    int dx[] = { 1, -1, 0, 0 };
+                    int dz[] = { 0, 0, 1, -1 };
+
+                    for (int i = 0; i < 4; i++) {
+                        glm::ivec3 targetPos(x + dx[i], y, z + dz[i]);
+                        uint8_t targetBlock = GetBlockGlobal(targetPos.x, targetPos.y, targetPos.z);
+
+                        // Jeśli obok jest pusto, wlej tam wodę
+                        if (targetBlock == BLOCK_ID_AIR) {
+                            changes.push_back({ targetPos, nextID });
+                        }
+                        // Jeśli obok jest SŁABSZA woda, nadpisz ją mocniejszą
+                        // (np. WATER_4 nadpisuje WATER_2)
+                        else if (targetBlock >= 13 && targetBlock <= 16) {
+                            if (nextID < targetBlock) { // Pamiętaj: mniejsze ID to mniejsza liczba w enumie, ale tutaj ID są odwrotnie (4=13, 1=16)
+                                // W naszym enumie: 4(13) < 3(14) < 2(15) < 1(16).
+                                // Więc "Silniejsza" woda ma MNIEJSZE ID.
+                                changes.push_back({ targetPos, nextID });
+                            }
+                        }
+                    }
+                }
+
+                // --- 3. WYSYCHANIE (Cleanup) ---
+                // Jeśli blok to Woda Płynąca, sprawdź czy ma "rodzica" (źródło zasilania)
+                if (isFlowing) {
+                    bool fed = false;
+
+                    // Sprawdź górę (czy woda spada na mnie?)
+                    uint8_t up = GetBlockGlobal(x, y + 1, z);
+                    if (up == BLOCK_ID_WATER || (up >= 13 && up <= 16)) fed = true;
+
+                    // Sprawdź boki (czy silniejsza woda wpływa we mnie?)
+                    if (!fed) {
+                        int dx[] = { 1, -1, 0, 0 };
+                        int dz[] = { 0, 0, 1, -1 };
+                        for (int i = 0; i < 4; i++) {
+                            uint8_t side = GetBlockGlobal(x + dx[i], y, z + dz[i]);
+
+                            // Źródło zawsze karmi
+                            if (side == BLOCK_ID_WATER) { fed = true; break; }
+
+                            // Silniejsza woda karmi słabszą
+                            // (Silniejsza ma MNIEJSZE ID: 13 < 14)
+                            if (side >= 13 && side <= 16) {
+                                if (side < current) { fed = true; break; }
+                            }
+                        }
+                    }
+
+                    // Jeśli nikt nie karmi -> wyschnij
+                    if (!fed) {
+                         changes.push_back({ glm::ivec3(x, y, z), BLOCK_ID_AIR });
+                    }
+                }
+            }
+        }
+    }
+
+    // Aplikuj zmiany
+    for (const auto& change : changes) {
+        SetBlock(change.pos.x, change.pos.y, change.pos.z, change.id);
+    }
+}
+void UpdateEntities(float dt) {
+    for (auto it = g_entities.begin(); it != g_entities.end(); ++it) {
+        // AI
+        it->moveTimer -= dt;
+        if (it->moveTimer <= 0.0f) {
+            it->moveTimer = 2.0f + (rand() % 30) / 10.0f;
+            it->isWalking = (rand() % 2 == 0);
+            if (it->isWalking) it->rotationY = (float)(rand() % 360);
+            else { it->velocity.x = 0.0f; it->velocity.z = 0.0f; }
+        }
+
+        // Ruch
+        if (it->isWalking) {
+            float speed = 2.0f;
+            float rad = glm::radians(it->rotationY);
+            it->velocity.x = sin(rad) * speed;
+            it->velocity.z = cos(rad) * speed;
+
+            // Auto-Jump
+            glm::vec3 frontPos = it->position + glm::normalize(glm::vec3(it->velocity.x, 0, it->velocity.z)) * 0.6f;
+            uint8_t blockFront = GetBlockGlobal(round(frontPos.x), round(frontPos.y), round(frontPos.z));
+            if (blockFront != BLOCK_ID_AIR && blockFront != BLOCK_ID_WATER && blockFront != BLOCK_ID_TORCH) {
+                 if (rand() % 100 < 5) it->velocity.y = 5.0f; // Skok
+            }
+        }
+
+        // Fizyka
+        it->velocity.y += GRAVITY * dt;
+        it->position += it->velocity * dt;
+
+        // Kolizja z podłogą
+        int blX = round(it->position.x);
+        int blY_under = floor(it->position.y - 0.5f);
+        int blZ = round(it->position.z);
+
+        uint8_t blockUnder = GetBlockGlobal(blX, blY_under, blZ);
+        bool isSolid = (blockUnder != BLOCK_ID_AIR && blockUnder != BLOCK_ID_WATER && blockUnder != BLOCK_ID_TORCH && blockUnder != BLOCK_ID_LEAVES);
+
+        if (isSolid && it->position.y - (float)blY_under < 1.0f && it->velocity.y <= 0.0f) {
+            it->position.y = (float)blY_under + 1.00f;
+            it->velocity.y = 0.0f;
+        }
+
+        it->velocity.x *= 0.9f;
+        it->velocity.z *= 0.9f;
+    }
+}
+
+// 2. Spawnowanie (Twój kod)
+void SpawnEntity(glm::vec3 pos) {
+    Entity e;
+    e.position = pos;
+    e.velocity = glm::vec3(0,0,0);
+    e.rotationY = 0.0f;
+    e.moveTimer = 0.0f;
+    e.isWalking = false;
+    e.health = 10.0f;
+    e.color = glm::vec3(1.0f, 0.8f, 0.6f);
+    g_entities.push_back(e);
+}
+void CheckCrafting() {
+    // Wyczyść wynik na start
+    g_craftingOutput = {BLOCK_ID_AIR, 0};
+
+    // --- RECEPTURA 1: DREWNO -> 4 DESKI (używamy Sandstone jako desek) ---
+    // Sprawdzamy każdy slot siatki. Jeśli którykolwiek zawiera LOG, dajemy wynik.
+    // (To prosta receptura "bezkształtna")
+
+    int logCount = 0;
+    int otherCount = 0;
+
+    for (int i = 0; i < 4; i++) {
+        if (g_craftingGrid[i].itemID == BLOCK_ID_LOG) logCount++;
+        else if (g_craftingGrid[i].itemID != BLOCK_ID_AIR) otherCount++;
+    }
+
+    // Jeśli mamy dokładnie 1 kłodę i nic więcej -> Daj 4 Deski
+    if (logCount == 1 && otherCount == 0) {
+        g_craftingOutput = {BLOCK_ID_SANDSTONE, 4};
+    }
+
+    int stoneCount = 0;
+    for (int i = 0; i < 4; i++) {
+        if (g_craftingGrid[i].itemID == BLOCK_ID_STONE) stoneCount++;
+    }
+
+    // Jeśli są 3 kamienie (i jedno puste miejsce, bo siatka ma 4 sloty)
+    if (stoneCount == 3) {
+        // Stwórz Kilof
+        g_craftingOutput.itemID = ITEM_ID_PICKAXE;
+        g_craftingOutput.count = 1;
+        g_craftingOutput.durability = 50;    // Wytrzyma na 50 bloków
+        g_craftingOutput.maxDurability = 50;
+    }
+}
+
+
+// --- FUNKCJA RYSOWANIA ANIMOWANEJ ŚWINKI ---
+void DrawPig(Shader& shader, const Entity& e, unsigned int vao) {
+    // Tekstura: Piaskowiec (Różowawa)
+    glm::vec2 uvOff = glm::vec2(UV_SANDSTONE[0], UV_SANDSTONE[1]);
+    shader.setVec2("u_uvOffset", uvOff);
+    shader.setVec2("u_uvOffsetTop", uvOff);
+    shader.setVec2("u_uvOffsetBottom", uvOff);
+    shader.setInt("u_multiTexture", 0);
+
+    // Parametry Animacji
+    float walkSpeed = 10.0f;
+    float maxAngle = 45.0f; // Większy wymach (jak w MC)
+    float swingAngle = 0.0f;
+
+    if (e.isWalking) {
+        swingAngle = sin(glfwGetTime() * walkSpeed) * maxAngle;
+    } else {
+        // Gdy stoi, nogi wracają do pionu (płynnie by było lepiej, ale 0.0f wystarczy)
+        swingAngle = 0.0f;
+    }
+
+    // Bazowa macierz (Pozycja Moba)
+    glm::mat4 baseModel = glm::mat4(1.0f);
+    baseModel = glm::translate(baseModel, e.position);
+    baseModel = glm::rotate(baseModel, glm::radians(e.rotationY ), glm::vec3(0, 1, 0));
+
+    // --- 1. TUŁÓW ---
+    {
+        glm::mat4 model = baseModel;
+        // Ciało musi być niżej, bo nogi są krótsze.
+        // Wysokość nóg to 0.4. Ciało (wys 0.6) zaczyna się na 0.4, więc jego środek to 0.4 + 0.3 = 0.7.
+        model = glm::translate(model, glm::vec3(0.0f, 0.7f, 0.0f));
+        model = glm::scale(model, glm::vec3(0.9f, 0.6f, 1.3f)); // Długi tułów
+
+        shader.setMat4("model", model);
+        glBindVertexArray(vao);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+    }
+
+    // --- 2. GŁOWA ---
+    {
+        glm::mat4 model = baseModel;
+        // Głowa na wysokości: 0.4 (nogi) + 0.6 (ciało) - trochę w dół = ~0.8/0.9
+        model = glm::translate(model, glm::vec3(0.0f, 1.0f, 0.8f));
+        model = glm::scale(model, glm::vec3(0.7f, 0.7f, 0.7f));
+
+        shader.setMat4("model", model);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+    }
+
+    // --- 3. NOGI ---
+    // Świnia ma krótkie nóżki!
+    // Wysokość nogi: 0.4
+    // Połowa wysokości (centrum sześcianu): 0.2
+
+    glm::vec3 legScale(0.25f, 0.4f, 0.25f);
+
+    // Pozycje "bioder" (punktów styku z ciałem)
+    // Y = 0.4 (spód ciała)
+    float hipY = 0.4f;
+
+    glm::vec3 legOrigins[] = {
+        glm::vec3(-0.3f, hipY,  0.4f), // Lewa Przednia
+        glm::vec3( 0.3f, hipY,  0.4f), // Prawa Przednia
+        glm::vec3(-0.3f, hipY, -0.4f), // Lewa Tylna
+        glm::vec3( 0.3f, hipY, -0.4f)  // Prawa Tylna
+    };
+
+    for (int i = 0; i < 4; i++) {
+        glm::mat4 model = baseModel;
+
+        // 1. Idź do punktu biodra
+        model = glm::translate(model, legOrigins[i]);
+
+        // 2. Oblicz kąt (chodzenie po przekątnej)
+        // LP (0) i PT (3) idą razem. PP (1) i LT (2) idą przeciwnie.
+        float currentAngle = (i == 0 || i == 3) ? -swingAngle : swingAngle;
+
+        // 3. Obróć w biodrze
+        model = glm::rotate(model, glm::radians(currentAngle), glm::vec3(1, 0, 0));
+
+        // 4. Przesuń w dół o połowę długości nogi
+        // (bo sześcian rysuje się od środka, a my jesteśmy w biodrze)
+        model = glm::translate(model, glm::vec3(0, -0.2f, 0)); // 0.2 to połowa z 0.4
+
+        // 5. Skaluj
+        model = glm::scale(model, legScale);
+
+        shader.setMat4("model", model);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+    }
+}
+void DrawDurabilityBar(Shader& uiShader, unsigned int vao, float x, float y, float w, float h, int cur, int max) {
+    if (max <= 0) return; // Nie rysuj dla zwykłych bloków
+
+    float percent = (float)cur / (float)max;
+
+    // Tło paska (Czarne)
+    float barH = 6.0f;
+    float barY = y + 2.0f; // 2 piksele od dołu slotu
+
+    // Wyłączamy tekstury (używamy czystego koloru z shadera?
+    // Nie mamy shadera koloru, więc użyjmy tricku z teksturą 'slotTextureID' bardzo ciemną lub jasną)
+    // Najprościej: Użyj 'texOverlay' (czarny) jako tła, i np. 'texSun' (jasny) jako paska, barwiąc go.
+    // Ale Twój shader UI nie obsługuje kolorowania vertexów (u_color).
+
+    // SZYBKI SPOSÓB: Użyjmy slotTextureID (szary) jako tła i texSun (biały/żółty) jako paska.
+    // Możesz dodać 'uniform vec4 u_color' do ui.frag, żeby to zrobić profesjonalnie.
+    // Na razie, narysujmy po prostu pasek.
+
+    // TŁO (Czarne - używamy texOverlay)
+    uiShader.setFloat("u_opacity", 1.0f);
+    uiShader.setVec2("u_uvScale", 1.0f, 1.0f);
+    uiShader.setVec2("u_uvOffset", 0.0f, 0.0f);
+    DrawMenuButton(uiShader, vao, texOverlay, x + 4, barY, w - 8, barH); // Margines 4px
+
+    // PASEK ŻYCIA (Zielony/Czerwony? Nie mamy kolorów, więc będzie biały z texSun lub szary)
+    // Żeby zrobić to porządnie, musisz dodać `uniform vec4 u_color` do ui.frag.
+    // Ale na szybko:
+    float fillW = (w - 8) * percent;
+    DrawMenuButton(uiShader, vao, texSun, x + 4, barY, fillW, barH);
+}
+void UpdateSurvival(float dt) {
+    if (isDead) return;
+
+    // 1. OBRAŻENIA OD UPADKU
+    // Sprawdzamy nagłą zmianę prędkości z dużej ujemnej na 0 (uderzenie)
+    if (onGround && lastYVelocity < -12.0f) {
+        // Oblicz obrażenia (im szybciej spadał, tym mocniej boli)
+        // -12 to bezpieczna prędkość. Każdy punkt powyżej to obrażenia.
+        float damage = (abs(lastYVelocity) - 12.0f) * 0.5f;
+        playerHealth -= damage;
+
+        // Dźwięk uderzenia (jeśli masz plik hurt.mp3)
+        // ma_engine_play_sound(&g_audioEngine, "hurt.mp3", NULL);
+        std::cout << "Ala! Obrazenia od upadku: " << damage << std::endl;
+    }
+    // Zapisz prędkość dla następnej klatki
+    lastYVelocity = playerVelocity.y;
+
+    // 2. TOPIENIE SIĘ (Drowning)
+    glm::vec3 headPos = camera.Position + glm::vec3(0.0f, PLAYER_EYE_HEIGHT, 0.0f);
+    uint8_t headBlock = GetBlockGlobal(round(headPos.x), round(headPos.y), round(headPos.z));
+
+    bool headInWater = (headBlock == BLOCK_ID_WATER || (headBlock >= 13 && headBlock <= 16));
+
+    if (headInWater && !camera.flyingMode) {
+        airTimer -= dt;
+        if (airTimer <= 0.0f) {
+            playerHealth -= 1.0f; // Zadaj obrażenia co chwilę
+            airTimer = 1.0f;      // Reset timer obrażeń (co 1 sekunda)
+            // ma_engine_play_sound(&g_audioEngine, "hurt.mp3", NULL);
+            std::cout << "Bul bul! Topie sie!" << std::endl;
+        }
+    } else {
+        // Regeneruj powietrze, gdy głowa nad wodą
+        airTimer += dt * 5.0f;
+        if (airTimer > 10.0f) airTimer = 10.0f;
+    }
+
+    // 3. ŚMIERĆ
+    if (playerHealth <= 0.0f) {
+        playerHealth = 0.0f;
+        isDead = true;
+        std::cout << "GAME OVER" << std::endl;
+        // Tutaj można dodać wyrzucenie ekwipunku na ziemię!
+    }
+}
+void InitClouds() {
+    // 1. Generuj teksturę chmur szumem Perlina
+    int width = 128;
+    int height = 128;
+    std::vector<unsigned char> data(width * height * 4); // RGBA
+
+    float scale = 0.08f; // Rozmiar "kłębków"
+
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            float noise = stb_perlin_noise3(x * scale, y * scale, 0.0f, 0, 0, 0);
+
+            // Próg: jeśli szum > 0.2, to jest chmura. Inaczej pusto.
+            unsigned char alpha = (noise > 0.2f) ? 255 : 0;
+
+            int index = (y * width + x) * 4;
+            data[index + 0] = 255; // R
+            data[index + 1] = 255; // G
+            data[index + 2] = 255; // B
+            data[index + 3] = alpha; // A
+        }
+    }
+
+    // 2. Stwórz Teksturę OpenGL
+    glGenTextures(1, &cloudTexture);
+    glBindTexture(GL_TEXTURE_2D, cloudTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data.data());
+
+    // KLUCZOWE: GL_NEAREST sprawi, że chmury będą "klockowate", a nie rozmyte!
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT); // Powtarzaj teksturę w nieskończoność
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+
+    // 3. Stwórz Wielki Prostokąt (Plane)
+    // Rozmiar 512x512 powinien pokryć cały widok RENDER_DISTANCE
+    float size = 512.0f;
+    float heightY = 100.0f; // Wysokość chmur
+
+    // Powtarzamy teksturę 4 razy na tym obszarze
+    float uvRep = 4.0f;
+
+    float vertices[] = {
+        // Pos(XYZ)           // UV
+        -size, heightY, -size,  0.0f, 0.0f,
+         size, heightY, -size,  uvRep, 0.0f,
+         size, heightY,  size,  uvRep, uvRep,
+        -size, heightY, -size,  0.0f, 0.0f,
+         size, heightY,  size,  uvRep, uvRep,
+        -size, heightY,  size,  0.0f, uvRep
+    };
+
+    glGenVertexArrays(1, &cloudVAO);
+    glGenBuffers(1, &cloudVBO);
+    glBindVertexArray(cloudVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, cloudVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
 }
