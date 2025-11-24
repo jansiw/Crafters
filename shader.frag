@@ -1,5 +1,6 @@
 #version 330 core
 out vec4 FragColor;
+out vec4 BrightColor;
 
 // --- DANE WEJŚCIOWE ---
 in vec2 TexCoord;
@@ -212,4 +213,14 @@ void main()
     float gamma = 1.8;
     result = pow(result, vec3(1.0 / gamma));
     FragColor = vec4(result, textureColor.a);
+
+    // Wyjście 2: Tylko jasne elementy (Bloom)
+    // Oblicz jasność piksela (średnia ważona)
+    float brightness = dot(result, vec3(0.2126, 0.7152, 0.0722));
+
+    // Jeśli coś jest bardzo jasne (np. lawa, słońce), zapisz to do bufora jasności
+    if(brightness > 1.0)
+    BrightColor = vec4(result, 1.0);
+    else
+    BrightColor = vec4(0.0, 0.0, 0.0, 1.0);
 }

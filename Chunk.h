@@ -43,6 +43,10 @@ const int SEA_LEVEL = 32;
 #define BLOCK_ID_IRON_ORE    18
 #define BLOCK_ID_GOLD_ORE    19
 #define BLOCK_ID_DIAMOND_ORE 21
+#define BLOCK_ID_LAVA    22 // Źródło
+#define BLOCK_ID_LAVA_3  23
+#define BLOCK_ID_LAVA_2  24
+#define BLOCK_ID_LAVA_1  25
 
 // --- Definicje Atlasu (bez zmian) ---
 const float ATLAS_COLS = 8.0f;
@@ -69,6 +73,7 @@ const float UV_COAL_ORE[2]    = { 5.0f * UV_STEP_U, 2.0f * UV_STEP_V };
 const float UV_IRON_ORE[2]    = { 5.0f * UV_STEP_U, 1.0f * UV_STEP_V };
 const float UV_GOLD_ORE[2]    = { 5.0f * UV_STEP_U, 0.0f * UV_STEP_V };
 const float UV_DIAMOND_ORE[2] = { 6.0f * UV_STEP_U, 2.0f * UV_STEP_V };
+const float UV_LAVA[2] = { 6.0f * UV_STEP_U, 1.0f * UV_STEP_V }; // Dostosuj do swojego atlasu!
 
 // --- Dane Geometrii (bez zmian) ---
 const float baseFaces[][18] = {
@@ -176,6 +181,29 @@ public:
     float vertexAO(bool side1, bool side2, bool corner) {
         if (side1 && side2) return 0.0f; // Róg całkowicie zasłonięty -> Najciemniej
         return 3.0f - ((side1 ? 1 : 0) + (side2 ? 1 : 0) + (corner ? 1 : 0));
+    }
+    float vertexLight(int x, int y, int z, bool s1, bool s2, bool c,
+                      int nx, int ny, int nz,
+                      int dx, int dy, int dz)
+    {
+        // Pobieramy światło z 4 bloków otaczających ten róg
+        // 1. Blok bezpośrednio przy ścianie (nx, ny, nz)
+        int l_face = 0;
+        if (nx >= 0 && nx < CHUNK_WIDTH && ny >= 0 && ny < CHUNK_HEIGHT && nz >= 0 && nz < CHUNK_DEPTH)
+            l_face = lightMap[nx][ny][nz];
+        else l_face = 15; // Krawędź świata = słońce
+
+        // 2. Side 1
+        int l_s1 = 0;
+        if (nx+dx >= 0 && nx+dx < CHUNK_WIDTH && ny+dy >= 0 && ny+dy < CHUNK_HEIGHT && nz+dz >= 0 && nz+dz < CHUNK_DEPTH)
+            l_s1 = lightMap[nx+dx][ny+dy][nz+dz]; // Uwaga: dx/dy/dz dodane do N
+        else l_s1 = 15;
+
+        // 3. Side 2 (To było skomplikowane w AO, tutaj upraszczamy - bierzemy z lightMap)
+        // W AO mieliśmy bool s1, s2. Tutaj musimy pobrać wartości z mapy.
+        // Dla uproszczenia: Zrobimy średnią z samego bloku przed twarzą i jego sąsiadów.
+
+        return (float)l_face / 15.0f; // NA RAZIE ZOSTAWMY PROSTĄ WERSJĘ, ALE ZARAZ JĄ ULEPSZYMY W PĘTLI
     }
     bool LoadFromFile() {
         std::string fileName = GetChunkFileName();
@@ -472,8 +500,15 @@ public:
 
                         // 4. Decyzja: Dziura czy Skała?
                         if (noise3D > dynamicThreshold) {
-                            blocks[x][y][z] = BLOCK_ID_AIR;
+                            if (y < 3) {
+                                blocks[x][y][z] = BLOCK_ID_LAVA;
+                            }
+                            else {
+                                // Wyżej jest normalna, pusta jaskinia
+                                blocks[x][y][z] = BLOCK_ID_AIR;
+                            }
                         }
+
                     }
 
                 }
@@ -687,9 +722,47 @@ public:
         if (localX < 0 || localX >= CHUNK_WIDTH || localZ < 0 || localZ >= CHUNK_DEPTH) return BLOCK_ID_AIR;
         return neighborChunk->blocks[localX][y][localZ];
     }
+    // Funkcja pobierająca światło (bezpieczna dla granic chunka)
+    uint8_t getLight(int x, int y, int z) {
+        // 1. Jeśli wewnątrz chunka, zwróć wartość
+        if (y >= 0 && y < CHUNK_HEIGHT && x >= 0 && x < CHUNK_WIDTH && z >= 0 && z < CHUNK_DEPTH) {
+            return lightMap[x][y][z];
+        }
 
+        // 2. Jeśli poza wysokością świata
+        if (y < 0) return 0; // Pod dnem jest ciemno
+        if (y >= CHUNK_HEIGHT) return 15; // Nad niebem jest jasno
+
+        // 3. Jeśli u sąsiada
+        int globalX = static_cast<int>(position.x) + x;
+        int globalZ = static_cast<int>(position.z) + z;
+        int chunkX = static_cast<int>(floor(static_cast<float>(globalX) / CHUNK_WIDTH));
+        int chunkZ = static_cast<int>(floor(static_cast<float>(globalZ) / CHUNK_DEPTH));
+
+        // Szukamy sąsiada w globalnej mapie
+        auto it = g_WorldChunks.find(glm::ivec2(chunkX, chunkZ));
+        if (it == g_WorldChunks.end()) {
+            // WAŻNE: Jeśli chunk nie jest załadowany, zwróć 0 (CIEMNOŚĆ),
+            // a nie 15. To naprawia świecące podziemia.
+            return 0;
+        }
+
+        Chunk* neighborChunk = it->second;
+        int localX = globalX - (chunkX * CHUNK_WIDTH);
+        int localZ = globalZ - (chunkZ * CHUNK_DEPTH);
+
+        // Zwróć światło sąsiada
+        return neighborChunk->lightMap[localX][y][localZ];
+    }
     bool isAnyWater(uint8_t id) {
         return id == BLOCK_ID_WATER || (id >= 13 && id <= 16);
+    }
+    bool isAnyLava(uint8_t id) {
+        return id == BLOCK_ID_LAVA || (id >= 23 && id <= 25);
+    }
+
+    bool isAnyLiquid(uint8_t id) {
+        return isAnyWater(id) || isAnyLava(id);
     }
     // Zwraca wysokość "sufitu" wody (identyczne wartości jak w addFaceToMesh)
     float getWaterHeight(uint8_t id) {
@@ -698,6 +771,10 @@ public:
         if (id == BLOCK_ID_WATER_3)      return 0.10f;
         if (id == BLOCK_ID_WATER_2)      return -0.10f;
         if (id == BLOCK_ID_WATER_1)      return -0.35f;
+        if (id == BLOCK_ID_LAVA)    return 0.40f;
+        if (id == BLOCK_ID_LAVA_3)  return 0.20f;
+        if (id == BLOCK_ID_LAVA_2)  return -0.10f;
+        if (id == BLOCK_ID_LAVA_1)  return -0.35f;
         return -1.0f; // Nie woda
     }
     void CalculateLighting() {
@@ -739,7 +816,10 @@ public:
         for (int x = 0; x < CHUNK_WIDTH; x++) {
             for (int z = 0; z < CHUNK_DEPTH; z++) {
                 for (int y = 0; y < CHUNK_HEIGHT; y++) {
-                    if (blocks[x][y][z] == BLOCK_ID_TORCH) {
+                    uint8_t block = blocks[x][y][z];
+
+                    // Pochodnia LUB Lawa (każda, nawet płynąca) dają światło
+                    if (block == BLOCK_ID_TORCH || isAnyLava(block)) {
                         lightMap[x][y][z] = 15;
                         queue.push_back({x, y, z, 15});
                     }
@@ -880,14 +960,34 @@ public:
                         // TEGO BRAKOWAŁO! To tutaj rysujemy ziemię, kamień, drewno.
                         else
                         {
-                            // Rysuj ściankę, jeśli sąsiad jest "przezroczysty" (powietrze, woda, liście, pochodnia)
-                            if (neighborID == BLOCK_ID_AIR ||
-                                isAnyWater(neighborID) ||
-                                neighborID == BLOCK_ID_ICE ||
-                                neighborID == BLOCK_ID_LEAVES ||
-                                neighborID == BLOCK_ID_TORCH)
-                            {
-                                addFaceToMesh(solidMesh, i, x, y, z, currentBlockID);
+                            // Logika dla LAWY (żeby łączyła się ze sobą)
+                            if (isAnyLava(currentBlockID)) {
+                                bool shouldDraw = true;
+                                if (isAnyLava(neighborID)) {
+                                    // Nie rysuj ściany między lawą, chyba że sąsiad jest niższy
+                                    if (getWaterHeight(currentBlockID) <= getWaterHeight(neighborID)) {
+                                        shouldDraw = false;
+                                    }
+                                }
+                                else if (!isAnyWater(neighborID) && neighborID != BLOCK_ID_AIR && neighborID != BLOCK_ID_LEAVES && neighborID != BLOCK_ID_TORCH) {
+                                    // Sąsiad jest solidny (np. kamień) -> nie rysuj
+                                    shouldDraw = false;
+                                }
+
+                                if (shouldDraw) addFaceToMesh(solidMesh, i, x, y, z, currentBlockID);
+                            }
+                            // Logika dla reszty bloków stałych
+                            else {
+                                // Rysuj, jeśli sąsiad jest "przezroczysty" (powietrze, woda, lawa, liście...)
+                                if (neighborID == BLOCK_ID_AIR ||
+                                    isAnyWater(neighborID) ||
+                                    isAnyLava(neighborID) ||  // <<< Lawa odsłania kamień
+                                    neighborID == BLOCK_ID_ICE ||
+                                    neighborID == BLOCK_ID_LEAVES ||
+                                    neighborID == BLOCK_ID_TORCH)
+                                {
+                                    addFaceToMesh(solidMesh, i, x, y, z, currentBlockID);
+                                }
                             }
                         }
                     }
@@ -993,6 +1093,7 @@ public:
         else if (blockID == BLOCK_ID_IRON_ORE)    uvBase = UV_IRON_ORE;
         else if (blockID == BLOCK_ID_GOLD_ORE)    uvBase = UV_GOLD_ORE;
         else if (blockID == BLOCK_ID_DIAMOND_ORE) uvBase = UV_DIAMOND_ORE;
+        else if (isAnyLava(blockID)) uvBase = UV_LAVA;
         else return;
         // -----------------------------------------------------------
 
@@ -1002,26 +1103,15 @@ public:
         // Oblicz wysokość dla wody
         float topHeight = 0.5f; // Domyślna wysokość (pełny blok)
 
-        if (isAnyWater(blockID)) {
-            // Sprawdź blok POWYŻEJ (y + 1)
-            // Używamy getBlock, który bezpiecznie sprawdza sąsiadów (nawet w innym chunku)
+        if (isAnyLiquid(blockID)) {
             uint8_t blockAbove = getBlock(x, y + 1, z);
-
-            // WARUNEK WODOSPADU:
-            // Jeśli nad nami jest woda, to my jesteśmy częścią pionowego strumienia (wodospadu).
-            // Wtedy musimy być PEŁNYM blokiem, żeby połączyć się z górą.
-            if (isAnyWater(blockAbove)) {
+            // Jeśli nad nami jest TA SAMA ciecz -> pełny blok
+            if ((isAnyWater(blockID) && isAnyWater(blockAbove)) ||
+                (isAnyLava(blockID) && isAnyLava(blockAbove))) {
                 topHeight = 0.5f;
-            }
-            else {
-                // Jeśli nad nami jest powietrze, to jesteśmy powierzchnią wody.
-                // Wtedy obniżamy poziom w zależności od siły nurtu.
-                if (blockID == BLOCK_ID_WATER)         topHeight = 0.40f;
-                else if (blockID == BLOCK_ID_WATER_4)  topHeight = 0.30f;
-                else if (blockID == BLOCK_ID_WATER_3)  topHeight = 0.10f;
-                else if (blockID == BLOCK_ID_WATER_2)  topHeight = -0.10f;
-                else if (blockID == BLOCK_ID_WATER_1)  topHeight = -0.35f;
-            }
+                } else {
+                    topHeight = getWaterHeight(blockID);
+                }
         }
 
         // --- OBLICZANIE AO ---
@@ -1046,59 +1136,90 @@ public:
             float vy = baseFaces[faceIndex][i * 3 + 1];
             float vz = baseFaces[faceIndex][i * 3 + 2];
 
-            // Woda: obniżanie sufitu
-            if (isAnyWater(blockID) && vy > 0.0f) vy = topHeight;
+            if (isAnyLiquid(blockID) && vy > 0.0f) vy = topHeight;
 
-            // --- LOGIKA AO ---
-            // Sprawdzamy, który to róg ściany, patrząc na współrzędne wierzchołka
-            // Przesunięcie względem środka bloku
+            // 1. Kierunki dla tego wierzchołka
             int dx = (vx > 0) ? 1 : -1;
             int dy = (vy > 0) ? 1 : -1;
             int dz = (vz > 0) ? 1 : -1;
 
-            // Jeśli normalna jest w osi, zerujemy przesunięcie w tej osi
             if (ax != 0) dx = 0;
             if (ay != 0) dy = 0;
             if (az != 0) dz = 0;
 
-            // Sprawdź 3 sąsiadów dla tego rogu (na płaszczyźnie ściany)
-            // Np. dla ściany górnej (Up), sprawdzamy bloki (x+1, y+1, z), (x, y+1, z+1) i róg (x+1, y+1, z+1)
+            // 2. Współrzędne bloku "przed" ścianą
+            int nx = x + ax;
+            int ny = y + ay;
+            int nz = z + az;
 
-            // Blok "na wprost" (w kierunku normalnej)
-            int nx = x + ax; int ny = y + ay; int nz = z + az;
+            // --- OBLICZANIE AO (Bez zmian) ---
+            // (Tutaj używamy getBlock jak wcześniej)
+            bool s1_solid = false, s2_solid = false, c_solid = false;
 
-            // Sąsiedzi boczni w warstwie 'n'
-            bool s1 = false, s2 = false, c = false;
-
-            // To jest generyczna logika wykrywania sąsiadów dla dowolnej ściany
-            // Używamy dx, dy, dz, które wskazują róg.
-
-            // Hack: aby nie pisać 6 if-ów, używamy logiki:
-            // Side1 to blok przesunięty tylko w jednej osi prostopadłej
-            // Side2 to blok przesunięty w drugiej osi prostopadłej
-            // Corner to blok przesunięty w obu
+            auto getSolid = [&](int _x, int _y, int _z) {
+                uint8_t id = getBlock(_x, _y, _z); // Używamy getBlock
+                return (id != BLOCK_ID_AIR && !isAnyWater(id) && id != BLOCK_ID_TORCH && id != BLOCK_ID_LEAVES);
+            };
 
             if (faceIndex == 0 || faceIndex == 1) { // Y
-                s1 = (getBlock(nx + dx, ny, nz) != BLOCK_ID_AIR && !isAnyWater(getBlock(nx + dx, ny, nz)));
-                s2 = (getBlock(nx, ny, nz + dz) != BLOCK_ID_AIR && !isAnyWater(getBlock(nx, ny, nz + dz)));
-                c  = (getBlock(nx + dx, ny, nz + dz) != BLOCK_ID_AIR && !isAnyWater(getBlock(nx + dx, ny, nz + dz)));
+                s1_solid = getSolid(nx + dx, ny, nz);
+                s2_solid = getSolid(nx, ny, nz + dz);
+                c_solid  = getSolid(nx + dx, ny, nz + dz);
             }
             else if (faceIndex == 2 || faceIndex == 3) { // Z
-                s1 = (getBlock(nx + dx, ny, nz) != BLOCK_ID_AIR && !isAnyWater(getBlock(nx + dx, ny, nz)));
-                s2 = (getBlock(nx, ny + dy, nz) != BLOCK_ID_AIR && !isAnyWater(getBlock(nx, ny + dy, nz)));
-                c  = (getBlock(nx + dx, ny + dy, nz) != BLOCK_ID_AIR && !isAnyWater(getBlock(nx + dx, ny + dy, nz)));
+                s1_solid = getSolid(nx + dx, ny, nz);
+                s2_solid = getSolid(nx, ny + dy, nz);
+                c_solid  = getSolid(nx + dx, ny + dy, nz);
             }
             else { // X
-                s1 = (getBlock(nx, ny, nz + dz) != BLOCK_ID_AIR && !isAnyWater(getBlock(nx, ny, nz + dz)));
-                s2 = (getBlock(nx, ny + dy, nz) != BLOCK_ID_AIR && !isAnyWater(getBlock(nx, ny + dy, nz)));
-                c  = (getBlock(nx, ny + dy, nz + dz) != BLOCK_ID_AIR && !isAnyWater(getBlock(nx, ny + dy, nz + dz)));
+                s1_solid = getSolid(nx, ny, nz + dz);
+                s2_solid = getSolid(nx, ny + dy, nz);
+                c_solid  = getSolid(nx, ny + dy, nz + dz);
             }
 
-            float aoLevel = vertexAO(s1, s2, c);
-            // Konwertuj poziom 0-3 na jasność (0.6 do 1.0)
+            float aoLevel = vertexAO(s1_solid, s2_solid, c_solid);
             float aoFactor = 0.5f + (aoLevel / 3.0f) * 0.5f;
-            // -----------------
 
+
+            // --- OBLICZANIE ŚWIATŁA (POPRAWIONE) ---
+            // Używamy nowej funkcji getLight() zamiast tablicy lightMap[]
+
+            int l_face = getLight(nx, ny, nz);
+            int l_s1 = 0, l_s2 = 0, l_c = 0;
+
+            if (faceIndex == 0 || faceIndex == 1) { // Y
+                l_s1 = getLight(nx + dx, ny, nz);
+                l_s2 = getLight(nx, ny, nz + dz);
+                l_c  = getLight(nx + dx, ny, nz + dz);
+            }
+            else if (faceIndex == 2 || faceIndex == 3) { // Z
+                l_s1 = getLight(nx + dx, ny, nz);
+                l_s2 = getLight(nx, ny + dy, nz);
+                l_c  = getLight(nx + dx, ny + dy, nz);
+            }
+            else { // X
+                l_s1 = getLight(nx, ny, nz + dz);
+                l_s2 = getLight(nx, ny + dy, nz);
+                l_c  = getLight(nx, ny + dy, nz + dz);
+            }
+
+            // Ulepszone uśrednianie:
+            // Jeśli blok sąsiedni jest lity (solid), to on "blokuje" światło.
+            // Wtedy nie powinniśmy brać jego ciemności (0) do średniej,
+            // bo to tworzy brzydkie cienie w rogach.
+            // Zamiast tego, bierzemy światło z l_face.
+
+            if (s1_solid) l_s1 = l_face;
+            if (s2_solid) l_s2 = l_face;
+            if (c_solid)  l_c  = l_face;
+
+            int totalLight = l_face + l_s1 + l_s2 + l_c;
+            float smoothLight = (float)totalLight / 4.0f;
+            float lightFactor = smoothLight / 15.0f;
+
+            if (lightFactor < 0.05f) lightFactor = 0.05f; // Minimum
+
+            // --- WYPEŁNIANIE MESHA ---
             mesh.push_back(vx + x);
             mesh.push_back(vy + y);
             mesh.push_back(vz + z);
@@ -1111,24 +1232,9 @@ public:
             mesh.push_back(baseNormals[faceIndex][i * 3 + 0]);
             mesh.push_back(baseNormals[faceIndex][i * 3 + 1]);
             mesh.push_back(baseNormals[faceIndex][i * 3 + 2]);
-
-            mesh.push_back(aoFactor); // <<< DODAJEMY AO DO MESHA
-            nx = x + ax;
-            ny = y + ay;
-            nz = z + az;
-            float lightLevel = 0.0f;
-
-            // Sprawdź granice (jeśli sąsiad jest w tym chunku)
-            if (nx >= 0 && nx < CHUNK_WIDTH && ny >= 0 && ny < CHUNK_HEIGHT && nz >= 0 && nz < CHUNK_DEPTH) {
-                lightLevel = (float)lightMap[nx][ny][nz] / 15.0f; // Normalizuj do 0.0 - 1.0
-            } else {
-                lightLevel = 1.0f; // Domyślne światło na krawędziach (słońce)
-            }
-
-            // Minimalne światło otoczenia (żeby nie było 100% czarno)
-            if (lightLevel < 0.1f) lightLevel = 0.1f;
-
-            mesh.push_back(lightLevel); // <<< DODAJ TO (Atrybut 4)
+            if (isAnyLava(blockID)) lightFactor = 1.0f;
+            mesh.push_back(aoFactor);    // Atrybut 3
+            mesh.push_back(lightFactor); // Atrybut 4
         }
     }
     void addTorchToMesh(std::vector<float>& mesh, int x, int y, int z) {

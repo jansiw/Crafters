@@ -2,6 +2,7 @@
 #include "miniaudio.h"
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
+#include "ViewFrustum.h" // <<< NOWOŚĆ
 #include <iostream>
 #include <list> // NOWOŚĆ: Do przechowywania chunków
 #include <cstdio> // Do licznika FPS
@@ -25,6 +26,40 @@
 #include <stb_image.h>
 #include <cstdlib> // Dla rand() i srand()
 #include <ctime>   // Dla time()
+#include <thread>
+#include <mutex>
+#include <queue>
+#include <atomic>
+
+// --- BEZPIECZNA KOLEJKA (Thread-Safe Queue) ---
+// Pozwala przesyłać dane między wątkiem gry a wątkiem ładowania
+template <typename T>
+class SafeQueue {
+private:
+    std::queue<T> q;
+    std::mutex m;
+public:
+    void push(T val) {
+        std::lock_guard<std::mutex> lock(m);
+        q.push(val);
+    }
+    bool try_pop(T& val) {
+        std::lock_guard<std::mutex> lock(m);
+        if (q.empty()) return false;
+        val = q.front();
+        q.pop();
+        return true;
+    }
+    bool empty() {
+        std::lock_guard<std::mutex> lock(m);
+        return q.empty();
+    }
+};
+
+// Kolejki komunikacyjne
+SafeQueue<glm::ivec2> g_chunksToLoad;   // Main -> Worker: "Zrób ten chunk"
+SafeQueue<Chunk*> g_chunksReady;        // Worker -> Main: "Zrobiłem, masz!"
+std::atomic<bool> g_isRunning{true};    // Flaga do zatrzymania wątku przy wyjściu
 enum GameState {
     STATE_MAIN_MENU,
     STATE_NEW_WORLD_MENU,
@@ -39,6 +74,12 @@ GameState g_currentState = STATE_MAIN_MENU;
 bool IsAnyWater(uint8_t id) {
     // 4 = Źródło, 13-16 = Płynąca (zgodnie z Chunk.h)
     return id == BLOCK_ID_WATER || (id >= 13 && id <= 16);
+}
+// --- Funkcja pomocnicza dla Lawy ---
+bool isAnyLava(uint8_t id) {
+    // Sprawdzamy ID źródła (22) oraz płynącej lawy (23, 24, 25)
+    // Upewnij się, że te numery zgadzają się z tymi w Chunk.h!
+    return id == BLOCK_ID_LAVA || (id >= 23 && id <= 25);
 }
 // Prototypy funkcji
 void framebuffer_size_callback(GLFWwindow* window, int width, int height);
@@ -72,10 +113,19 @@ bool AddItemToInventory(uint8_t itemID, int count);
 void DrawDurabilityBar(Shader& uiShader, unsigned int vao, float x, float y, float w, float h, int cur, int max);
 void UpdateSurvival(float dt);
 void InitClouds();
+void ChunkWorkerThread();
+void UnloadFarChunks();
 
 const int INVENTORY_SLOTS = 36; // 9 slotów hotbara + 27 slotów plecaka
 const int MAX_STACK_SIZE = 64;
-
+bool g_openglInitialized = false;
+unsigned int hdrFBO=0;
+unsigned int colorBuffers[2]; // 0 = Scene, 1 = Brightness
+unsigned int rboDepth;
+unsigned int pingpongFBO[2];
+unsigned int pingpongColorbuffers[2];
+unsigned int quadVAO = 0;
+unsigned int quadVBO;
 struct ItemStack {
     uint8_t itemID = BLOCK_ID_AIR;
     int count = 0;
@@ -101,7 +151,13 @@ unsigned int cloudVAO, cloudVBO;
 // Do obrażeń od upadku
 float lastYVelocity = 0.0f;
 ItemStack g_mouseItem = {BLOCK_ID_AIR, 0};
+float g_lavaTimer = 0.0f;
+enum EntityType {
+    ENTITY_PIG,
+    ENTITY_ZOMBIE
+};
 struct Entity {
+    EntityType type;    // <<< NOWOŚĆ: Co to jest?
     glm::vec3 position;
     glm::vec3 velocity;
     float rotationY;    // Obrót w osi Y (gdzie patrzy)
@@ -111,6 +167,7 @@ struct Entity {
 
     // Kolor (dla uproszczenia użyjemy koloru zamiast tekstury na start)
     glm::vec3 color;
+    float attackCooldown; // Żeby nie bił co klatkę
 };
 void DrawPig(Shader& shader, const Entity& e, unsigned int vao);
 std::list<Entity> g_entities; // Lista wszystkich mobów
@@ -529,6 +586,11 @@ const float BAR_WIDTH = (SLOT_SIZE * HOTBAR_SIZE) + (GAP * (HOTBAR_SIZE - 1));
 float BAR_START_X;
 const float ICON_ATLAS_COLS = 18.0f; // Ile jest ikonek w rzędzie w pliku ui_icons.png
 const float ICON_ATLAS_ROWS = 1.0f; // Ile jest rzędów
+void DrawZombie(Shader& shader, const Entity& e, unsigned int vao);
+void InitBloom();
+void RenderQuad();
+void UpdateEntities(float dt, glm::vec3 playerPos);
+
 int main()
 {
     const float G_SKYBOX_VERTICES[] = {
@@ -545,9 +607,9 @@ int main()
     g_inventory[3] = {BLOCK_ID_TORCH, 64};
     g_inventory[4] = {BLOCK_ID_LOG, 64};
     g_inventory[5] = {BLOCK_ID_LEAVES, 64};
-    g_inventory[6] = {BLOCK_ID_SAND, 64};
+    g_inventory[6] = {BLOCK_ID_LAVA, 64};
     g_inventory[7] = {BLOCK_ID_WATER, 64};
-    g_inventory[8] = {BLOCK_ID_BEDROCK, 64};
+    g_inventory[8] = {BLOCK_ID_LAVA, 64}; // <<< ZMIEŃ OSTATNI SLOT NA LAWĘ
 
     g_selectedBlockID = g_inventory[g_activeSlot].itemID;
     // --- 1. Inicjalizacja ---
@@ -597,6 +659,9 @@ int main()
     }
     InitDropMesh();
     InitClouds();
+    InitBloom();
+    g_openglInitialized = true;
+    std::thread loaderThread(ChunkWorkerThread);
     Shader cloudShader("clouds.vert", "clouds.frag");
     // Włączanie debugowania komunikatów OpenGL
     #ifdef DEBUG
@@ -612,7 +677,11 @@ int main()
 
     // --- 2. Budowanie shaderów ---
     Shader ourShader("shader.vert", "shader.frag");
-
+    Shader blurShader("blur.vert", "blur.frag");
+    Shader finalShader("final.vert", "final.frag");
+    finalShader.use();
+    finalShader.setInt("scene", 0);
+    finalShader.setInt("bloomBlur", 1);
     // --- 3. Ładowanie tekstury (ATLAS) ---
     unsigned int textureAtlas;
     glGenTextures(1, &textureAtlas);
@@ -1307,8 +1376,9 @@ int main()
             UpdateParticles(physicsDelta); // <<< DODAJ TĘ LINIĘ
             UpdateMining(deltaTime);
             UpdateLiquids(deltaTime);
-            UpdateEntities(physicsDelta);
+            UpdateEntities(physicsDelta, camera.Position);
             UpdateSurvival(deltaTime);
+            UnloadFarChunks();
             bool isMoving = (glm::length(glm::vec2(playerVelocity.x, playerVelocity.z)) > 0.1f);
 
             if (isMoving && onGround) {
@@ -1339,41 +1409,77 @@ int main()
             int playerChunkX = static_cast<int>(floor(camera.Position.x / CHUNK_WIDTH));
             int playerChunkZ = static_cast<int>(floor(camera.Position.z / CHUNK_DEPTH));
 
-            // Już nie potrzebujemy wektora 'chunksToBuild'
-            // std::vector<Chunk*> chunksToBuild;
+            int pCX = playerChunkX;
+            int pCZ = playerChunkZ;
 
-            for (int x = playerChunkX - RENDER_DISTANCE; x <= playerChunkX + RENDER_DISTANCE; x++) {
-                for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
-                    glm::ivec2 chunkPos(x, z);
+            // A. ZLECANIE PRACY (Main -> Worker)
+            // Sprawdzamy, których chunków brakuje i dodajemy je do kolejki
+            // Limitujemy liczbę zleceń, żeby nie zapchać pamięci (np. max 50 w kolejce)
+            int requestsSent = 0;
 
-                    // Jeśli chunk nie istnieje...
-                    if (g_WorldChunks.find(chunkPos) == g_WorldChunks.end())
+            // Specjalna mapa, żeby nie zlecać dwa razy tego samego (gdy worker jeszcze mieli)
+            static std::map<glm::ivec2, bool, CompareIveco2> pendingChunks;
+
+            for (int x = pCX - RENDER_DISTANCE; x <= pCX + RENDER_DISTANCE; x++) {
+                for (int z = pCZ - RENDER_DISTANCE; z <= pCZ + RENDER_DISTANCE; z++) {
+
+                    if (requestsSent > 2) break; // Max 2 zlecenia na klatkę, żeby nie zamulić kolejki
+
+                    glm::ivec2 pos(x, z);
+
+                    // Jeśli chunka nie ma I nie jest w trakcie robienia
+                    if (g_WorldChunks.find(pos) == g_WorldChunks.end() &&
+                        pendingChunks.find(pos) == pendingChunks.end())
                     {
-                        // 1. Stwórz go i zbuduj jego mesh
-                        chunk_storage.emplace_back(glm::vec3(x * CHUNK_WIDTH, 0.0f, z * CHUNK_DEPTH), g_selectedWorldName, g_selectedWorldSeed);
-                        Chunk* newChunk = &chunk_storage.back();
-                        g_WorldChunks[chunkPos] = newChunk;
-                        newChunk->buildMesh(); // Zbuduj mesh od razu
-                        newChunk->CalculateLighting();
-
-                        // 2. KLUCZOWY KROK: Powiedz istniejącym sąsiadom, żeby też się przebudowali
-                        auto findAndBuild = [&](int nX, int nZ) {
-                            auto it = g_WorldChunks.find(glm::ivec2(nX, nZ));
-                            if (it != g_WorldChunks.end()) {
-                                it->second->buildMesh();
-                            }
-                        };
-
-                        findAndBuild(x + 1, z); // Sąsiad +X
-                        findAndBuild(x - 1, z); // Sąsiad -X
-                        findAndBuild(x, z + 1); // Sąsiad +Z
-                        findAndBuild(x, z - 1); // Sąsiad -Z
+                        g_chunksToLoad.push(pos); // Wyślij do workera
+                        pendingChunks[pos] = true; // Oznacz jako "w toku"
+                        requestsSent++;
                     }
                 }
             }
-        // for (Chunk* chunk : chunksToBuild) {
-        //     chunk->buildMesh();
-        // }
+
+            // B. ODBIERANIE GOTOWYCH (Worker -> Main)
+            // Sprawdzamy, czy worker coś skończył
+            Chunk* readyChunk = nullptr;
+            int chunksProcessed = 0;
+
+            // Przetwarzamy max 2 gotowe chunki na klatkę (żeby buildMesh nie zlagował)
+            while (chunksProcessed < 2 && g_chunksReady.try_pop(readyChunk)) {
+
+                glm::ivec2 pos(readyChunk->position.x / CHUNK_WIDTH, readyChunk->position.z / CHUNK_DEPTH);
+
+                // Dodaj do świata (Teraz wątek główny jest właścicielem)
+                g_WorldChunks[pos] = readyChunk;
+                // Dodaj do listy (żeby SaveWorld działał) - chociaż chunk_storage to lista obiektów, a tu mamy wskaźnik...
+                // POPRAWKA ARCHITEKTURY: Musimy zmienić chunk_storage na listę wskaźników,
+                // ALBO (prościej dla Ciebie teraz) dodać wskaźnik do specjalnej listy `std::vector<Chunk*> loadedChunksPtrs;`
+                // Ale Twój kod używa `chunk_storage` jako `std::list<Chunk>`.
+                // Żeby nie psuć: zrobimy kopię (trochę wolniej, ale bezpieczniej w obecnym kodzie)
+                chunk_storage.push_back(*readyChunk);
+                // Teraz g_WorldChunks musi wskazywać na element w liście, a nie na readyChunk (który zaraz usuniemy)
+                g_WorldChunks[pos] = &chunk_storage.back();
+                delete readyChunk; // Usuwamy tymczasowy obiekt z workera, bo skopiowaliśmy go do listy
+
+                // Usuń z listy oczekujących
+                pendingChunks.erase(pos);
+
+                // TERAZ (w wątku głównym) możemy bezpiecznie wywołać OpenGL
+                Chunk* finalChunk = g_WorldChunks[pos];
+                finalChunk->CalculateLighting();
+                finalChunk->buildMesh();
+
+                // Odśwież sąsiadów
+                auto refresh = [&](int dx, int dz) {
+                     auto it = g_WorldChunks.find(glm::ivec2(pos.x + dx, pos.y + dz));
+                     if (it != g_WorldChunks.end()) {
+                         it->second->CalculateLighting();
+                         it->second->buildMesh();
+                     }
+                };
+                refresh(1, 0); refresh(-1, 0); refresh(0, 1); refresh(0, -1);
+
+                chunksProcessed++;
+            }
 
         // --- 4. RENDEROWANIE ---
       float dayDuration = 300.0f; // Pełen cykl (dzień + noc) trwa 60 sekund
@@ -1453,9 +1559,13 @@ int main()
                 glCullFace(GL_BACK);
                 // ---------------------------------
             }
-
+            glBindFramebuffer(GL_FRAMEBUFFER, hdrFBO);
+            glClearColor(currentSkyColor.x, currentSkyColor.y, currentSkyColor.z, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
         // --- PRZEBIEG 2: NORMALNE RENDEROWANIE (Z PERSPEKTYWY GRACZA) ---
-        glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
+            ViewFrustum frustum;
+            frustum.Update(projection * view); // Macierz VP (View-Projection)
         // (glClear jest już wywołany na górze)
 
         // --- PRZEBIEG 2A: SKYBOX ---
@@ -1528,8 +1638,11 @@ int main()
             glBindVertexArray(dropVAO);
 
             for (const auto& e : g_entities) {
-                // Wywołaj naszą nową funkcję rysującą
-                DrawPig(ourShader, e, dropVAO);
+                if (e.type == ENTITY_PIG) {
+                    DrawPig(ourShader, e, dropVAO);
+                } else if (e.type == ENTITY_ZOMBIE) {
+                    DrawZombie(ourShader, e, dropVAO);
+                }
             }
 
             ourShader.setInt("u_useUVTransform", 0);
@@ -1642,7 +1755,13 @@ int main()
             for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
                 auto it = g_WorldChunks.find(glm::ivec2(x, z));
                 if (it != g_WorldChunks.end()) {
-                    it->second->DrawSolid(ourShader, textureAtlas);
+                    glm::vec3 min = it->second->position;
+                    glm::vec3 max = min + glm::vec3(CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH);
+
+                    if (frustum.IsBoxVisible(min, max)) { // <<< TYLKO JEŚLI WIDOCZNY
+                        it->second->DrawSolid(ourShader, textureAtlas);
+                    }
+                    // it->second->DrawSolid(ourShader, textureAtlas);
                 }
             }
         }
@@ -1654,7 +1773,11 @@ int main()
                 for (int z = playerChunkZ - RENDER_DISTANCE; z <= playerChunkZ + RENDER_DISTANCE; z++) {
                     auto it = g_WorldChunks.find(glm::ivec2(x, z));
                     if (it != g_WorldChunks.end()) {
-                        it->second->DrawFoliage(ourShader, textureAtlas); // <<< Użyj nowej funkcji
+                        glm::vec3 min = it->second->position;
+                        glm::vec3 max = min + glm::vec3(CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH);
+                        if (frustum.IsBoxVisible(min, max)) {
+                            it->second->DrawFoliage(ourShader, textureAtlas);
+                        } // <<< Użyj nowej funkcji
                     }
                 }
             }
@@ -1703,12 +1826,15 @@ int main()
 
                         // Oblicz kwadrat dystansu od kamery do środka chunka
                         // (Nie musimy liczyć pierwiastka (sqrt), sam kwadrat wystarczy do sortowania)
-                        glm::vec3 chunkCenter = chunk->position + glm::vec3(CHUNK_WIDTH / 2.0f, CHUNK_HEIGHT / 2.0f, CHUNK_DEPTH / 2.0f);
-                        glm::vec3 vecToChunk = camera.Position - chunkCenter;
-                        float distanceSq = glm::dot(vecToChunk, vecToChunk); // Użyj iloczynu skalarnego
+                        glm::vec3 min = chunk->position;
+                        glm::vec3 max = min + glm::vec3(CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH);
 
-                        // Dodaj do posortowanej mapy
-                        sortedChunks[distanceSq] = chunk;
+                        if (frustum.IsBoxVisible(min, max)) { // <<< DODAJ TO
+                            glm::vec3 chunkCenter = chunk->position + glm::vec3(CHUNK_WIDTH / 2.0f, CHUNK_HEIGHT / 2.0f, CHUNK_DEPTH / 2.0f);
+                            glm::vec3 vecToChunk = camera.Position - chunkCenter;
+                            float distanceSq = glm::dot(vecToChunk, vecToChunk);
+                            sortedChunks[distanceSq] = chunk;
+                        }
                     }
                 }
             }
@@ -1953,7 +2079,34 @@ ourShader.use();
 
 
         // 3A: Słońce 2D
+            bool horizontal = true, first_iteration = true;
+            int amount = 10;
+            blurShader.use();
+            for (int i = 0; i < amount; i++)
+            {
+                glBindFramebuffer(GL_FRAMEBUFFER, pingpongFBO[horizontal]);
+                blurShader.setInt("horizontal", horizontal);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, first_iteration ? colorBuffers[1] : pingpongColorbuffers[!horizontal]);
+                RenderQuad();
+                horizontal = !horizontal;
+                if (first_iteration) first_iteration = false;
+            }
 
+            // B. Rysowanie na Ekran (Final Quad)
+            glBindFramebuffer(GL_FRAMEBUFFER, 0); // <<< WRACAMY NA EKRAN!
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); // Czyścimy ekran
+
+            finalShader.use();
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, colorBuffers[0]); // Scena
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, pingpongColorbuffers[!horizontal]); // Bloom
+
+            // (Ważne: Wyłącz Depth Test dla Quada)
+            glDisable(GL_DEPTH_TEST);
+            RenderQuad();
+            glEnable(GL_DEPTH_TEST);
         // PRZEBIEG 3: UI (Celownik)
         glDisable(GL_DEPTH_TEST);
         crosshairShader.use();
@@ -2041,6 +2194,7 @@ ourShader.use();
             else if (blockID == BLOCK_ID_IRON_ORE)    iconIndex = 14.0f;
             else if (blockID == BLOCK_ID_GOLD_ORE)    iconIndex = 15.0f;
             else if (blockID == BLOCK_ID_DIAMOND_ORE) iconIndex = 16.0f;
+            else if (blockID == BLOCK_ID_LAVA) iconIndex = 3.0f;
 
             // Przesuwamy UV do odpowiedniej ikony
             glm::vec2 uvOffset(iconIndex / ICON_ATLAS_COLS, 0.0f);
@@ -3101,10 +3255,14 @@ ourShader.use();
     glDeleteBuffers(1, &crosshairVBO); // <<< NOWOŚĆ
     glDeleteVertexArrays(1, &highlighterVAO); // <<< NOWOŚĆ
     glDeleteBuffers(1, &highlighterVBO);
+    g_isRunning = false;
+    loaderThread.join(); // Czekaj aż wątek skończy
     ma_engine_uninit(&g_audioEngine);
     glfwTerminate();
     return 0;
 }
+
+void SpawnEntity(glm::vec3 pos, EntityType type);
 
 void processInput(GLFWwindow *window)
 {
@@ -3139,10 +3297,17 @@ void processInput(GLFWwindow *window)
     // Zaktualizuj stan na następną klatkę
     esc_pressed_last_frame = esc_is_pressed_now;
     static bool m_pressed = false;
+    static bool z_pressed = false;
+    if (glfwGetKey(window, GLFW_KEY_Z) == GLFW_PRESS) { // Z jak Zombie
+        if (!z_pressed) {
+            SpawnEntity(camera.Position + camera.Front * 5.0f, ENTITY_ZOMBIE);
+            z_pressed = true;
+        }
+    } else z_pressed = false;
     if (glfwGetKey(window, GLFW_KEY_M) == GLFW_PRESS) {
         if (!m_pressed) {
             glm::vec3 spawnPos = camera.Position + (camera.Front * 3.0f); // 3 metry przed graczem
-            SpawnEntity(spawnPos);
+            SpawnEntity(spawnPos, ENTITY_PIG);
             std::cout << "Zespawnowano Swinke!" << std::endl;
             m_pressed = true;
         }
@@ -3855,6 +4020,11 @@ void UpdateScreenSize(int width, int height)
     // 5. Zaktualizuj viewport OpenGL
     // glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
     std::cout << "Poprawnie wykonano glViewport" << std::endl;
+    if (g_openglInitialized) { // <<< TYLKO JEŚLI OPENGL JEST GOTOWY
+        glViewport(0, 0, width, height);
+        InitBloom(); // Przebuduj bufory dla nowej rozdzielczości
+    }
+    std::cout << "Poprawnie wykonano InitBloom" << std::endl;
 }
 // Zmodyfikowana funkcja: zwraca 'true', jeśli udało się dodać CAŁOŚĆ
 bool AddItemToInventory(uint8_t itemID, int count)
@@ -4181,7 +4351,7 @@ void LoadInventory() {
     g_inventory[5] = {BLOCK_ID_LEAVES, 64};
     g_inventory[6] = {BLOCK_ID_SAND, 64};
     g_inventory[7] = {BLOCK_ID_WATER, 64};
-    g_inventory[8] = {BLOCK_ID_BEDROCK, 64};
+    g_inventory[8] = {BLOCK_ID_LAVA, 64};
 
     // 2. Sprawdź, czy plik zapisu istnieje
     std::string path = "worlds/" + g_selectedWorldName + "/inventory.dat";
@@ -4351,64 +4521,154 @@ void UpdateLiquids(float dt) {
             }
         }
     }
+    g_lavaTimer += dt;
+    if (g_lavaTimer < 0.50f) return; // Lawa płynie co 0.5 sekundy
+    g_lavaTimer = 0.0f;
 
+    // Kopiujemy logikę wody, ale zmieniamy ID
+
+
+    for (int x = pPos.x - radius; x <= pPos.x + radius; x++) {
+        for (int z = pPos.z - radius; z <= pPos.z + radius; z++) {
+            for (int y = 0; y < CHUNK_HEIGHT; y++) {
+                uint8_t current = GetBlockGlobal(x, y, z);
+
+                if (!isAnyLava(current)) continue;
+
+                // 1. Spadanie
+                uint8_t down = GetBlockGlobal(x, y - 1, z);
+                if (down == BLOCK_ID_AIR) {
+                    changes.push_back({ glm::ivec3(x, y - 1, z), BLOCK_ID_LAVA_3 }); // Spada jako silna lawa
+                    continue;
+                }
+                // Lawa niszczy rośliny/pochodnie pod sobą (opcjonalnie)
+
+                // 2. Rozlewanie
+                uint8_t nextID = BLOCK_ID_AIR;
+                if (current == BLOCK_ID_LAVA)   nextID = BLOCK_ID_LAVA_3;
+                else if (current == BLOCK_ID_LAVA_3) nextID = BLOCK_ID_LAVA_2;
+                else if (current == BLOCK_ID_LAVA_2) nextID = BLOCK_ID_LAVA_1;
+                // LAVA_1 nie płynie dalej (krótszy zasięg niż woda)
+
+                if (nextID != BLOCK_ID_AIR) {
+                    int dx[] = {1, -1, 0, 0}; int dz[] = {0, 0, 1, -1};
+                    for(int i=0; i<4; i++) {
+                        glm::ivec3 tPos(x+dx[i], y, z+dz[i]);
+                        uint8_t target = GetBlockGlobal(tPos.x, tPos.y, tPos.z);
+
+                        if (target == BLOCK_ID_AIR) {
+                            changes.push_back({tPos, nextID});
+                        }
+                        // Kolizja z wodą -> Kamień (Cobblestone generator!)
+                        else if (IsAnyWater(target)) {
+                             changes.push_back({tPos, BLOCK_ID_STONE});
+                             ma_engine_play_sound(&g_audioEngine, "fizz.mp3", NULL); // Dźwięk syczenia
+                        }
+                    }
+                }
+
+                // (Dodaj też logikę wysychania, analogicznie do wody)
+            }
+        }
+    }
     // Aplikuj zmiany
     for (const auto& change : changes) {
         SetBlock(change.pos.x, change.pos.y, change.pos.z, change.id);
     }
 }
-void UpdateEntities(float dt) {
-    for (auto it = g_entities.begin(); it != g_entities.end(); ++it) {
-        // AI
-        it->moveTimer -= dt;
-        if (it->moveTimer <= 0.0f) {
-            it->moveTimer = 2.0f + (rand() % 30) / 10.0f;
-            it->isWalking = (rand() % 2 == 0);
-            if (it->isWalking) it->rotationY = (float)(rand() % 360);
-            else { it->velocity.x = 0.0f; it->velocity.z = 0.0f; }
+void UpdateEntities(float dt, glm::vec3 playerPos) {
+    for (auto it = g_entities.begin(); it != g_entities.end(); ) {
+
+        // --- LOGIKA ZOMBIE ---
+        if (it->type == ENTITY_ZOMBIE) {
+            float dist = glm::distance(it->position, playerPos);
+
+            // 1. Wykrywanie gracza (np. z 15 kratek)
+            if (dist < 15.0f) {
+                it->isWalking = true;
+
+                // Oblicz wektor w stronę gracza
+                glm::vec3 dir = glm::normalize(playerPos - it->position);
+
+                // Obróć zombie w stronę gracza (atan2 zwraca kąt w radianach)
+                it->rotationY = glm::degrees(atan2(dir.x, dir.z));
+
+                // Ustaw prędkość (Zombie jest wolniejszy od gracza)
+                float speed = 4.5f;
+                it->velocity.x = dir.x * speed;
+                it->velocity.z = dir.z * speed;
+
+                // Auto-Jump (jeśli uderzy w ścianę)
+                glm::vec3 frontPos = it->position + dir * 0.6f;
+                uint8_t blockFront = GetBlockGlobal(round(frontPos.x), round(frontPos.y), round(frontPos.z));
+                if (blockFront != BLOCK_ID_AIR && blockFront != BLOCK_ID_WATER) {
+                     if (onGround) it->velocity.y = 6.0f;
+                }
+
+                // Atakowanie gracza
+                if (dist < 1.0f) {
+                    it->attackCooldown -= dt;
+                    if (it->attackCooldown <= 0.0f) {
+                        playerHealth -= 1.5f; // Zabierz 1.5 serca
+                        it->attackCooldown = 1.0f; // Bij co sekundę
+                        // ma_engine_play_sound(&g_audioEngine, "hurt.mp3", NULL);
+                        std::cout << "Zombie ugryzl gracza!" << std::endl;
+                    }
+                }
+            } else {
+                // Jeśli gracz daleko - stój w miejscu (lub idź losowo, jak chcesz)
+                it->isWalking = false;
+                it->velocity.x = 0.0f;
+                it->velocity.z = 0.0f;
+            }
         }
-
-        // Ruch
-        if (it->isWalking) {
-            float speed = 2.0f;
-            float rad = glm::radians(it->rotationY);
-            it->velocity.x = sin(rad) * speed;
-            it->velocity.z = cos(rad) * speed;
-
-            // Auto-Jump
-            glm::vec3 frontPos = it->position + glm::normalize(glm::vec3(it->velocity.x, 0, it->velocity.z)) * 0.6f;
-            uint8_t blockFront = GetBlockGlobal(round(frontPos.x), round(frontPos.y), round(frontPos.z));
-            if (blockFront != BLOCK_ID_AIR && blockFront != BLOCK_ID_WATER && blockFront != BLOCK_ID_TORCH) {
-                 if (rand() % 100 < 5) it->velocity.y = 5.0f; // Skok
+        // --- LOGIKA ŚWINI (Stara) ---
+        else if (it->type == ENTITY_PIG) {
+            it->moveTimer -= dt;
+            if (it->moveTimer <= 0.0f) {
+                it->moveTimer = 2.0f + (rand() % 30) / 10.0f;
+                it->isWalking = (rand() % 2 == 0);
+                if (it->isWalking) it->rotationY = (float)(rand() % 360);
+                else { it->velocity.x = 0.0f; it->velocity.z = 0.0f; }
+            }
+            if (it->isWalking) {
+                float speed = 2.0f;
+                float rad = glm::radians(it->rotationY);
+                it->velocity.x = sin(rad) * speed;
+                it->velocity.z = cos(rad) * speed;
+                // (Tu można dodać auto-jump dla świni)
             }
         }
 
-        // Fizyka
+        // --- WSPÓLNA FIZYKA ---
         it->velocity.y += GRAVITY * dt;
         it->position += it->velocity * dt;
 
         // Kolizja z podłogą
         int blX = round(it->position.x);
-        int blY_under = floor(it->position.y - 0.5f);
+        int blY_under = floor(it->position.y - 0.05f);
         int blZ = round(it->position.z);
-
         uint8_t blockUnder = GetBlockGlobal(blX, blY_under, blZ);
         bool isSolid = (blockUnder != BLOCK_ID_AIR && blockUnder != BLOCK_ID_WATER && blockUnder != BLOCK_ID_TORCH && blockUnder != BLOCK_ID_LEAVES);
 
-        if (isSolid && it->position.y - (float)blY_under < 1.0f && it->velocity.y <= 0.0f) {
-            it->position.y = (float)blY_under + 1.00f;
+        if (isSolid && it->position.y - (float)blY_under < 1.1f && it->velocity.y <= 0.0f) {
+            it->position.y = (float)blY_under + 1.001f;
             it->velocity.y = 0.0f;
         }
 
+        // Tarcie
         it->velocity.x *= 0.9f;
         it->velocity.z *= 0.9f;
+
+        ++it;
     }
 }
 
 // 2. Spawnowanie (Twój kod)
-void SpawnEntity(glm::vec3 pos) {
+void SpawnEntity(glm::vec3 pos,EntityType type) {
     Entity e;
     e.position = pos;
+    e.type = type; // <<< Przypisz typ
     e.velocity = glm::vec3(0,0,0);
     e.rotationY = 0.0f;
     e.moveTimer = 0.0f;
@@ -4597,6 +4857,8 @@ void UpdateSurvival(float dt) {
     // 2. TOPIENIE SIĘ (Drowning)
     glm::vec3 headPos = camera.Position + glm::vec3(0.0f, PLAYER_EYE_HEIGHT, 0.0f);
     uint8_t headBlock = GetBlockGlobal(round(headPos.x), round(headPos.y), round(headPos.z));
+    glm::vec3 feetPos = camera.Position; // Pozycja nóg
+    uint8_t feetBlock = GetBlockGlobal(round(feetPos.x), round(feetPos.y), round(feetPos.z));
 
     bool headInWater = (headBlock == BLOCK_ID_WATER || (headBlock >= 13 && headBlock <= 16));
 
@@ -4612,6 +4874,11 @@ void UpdateSurvival(float dt) {
         // Regeneruj powietrze, gdy głowa nad wodą
         airTimer += dt * 5.0f;
         if (airTimer > 10.0f) airTimer = 10.0f;
+    }
+    if (isAnyLava(headBlock) || isAnyLava(feetBlock)) { // Sprawdź głowę i nogi
+        playerHealth -= 2.0f * dt * 5.0f; // Bardzo szybkie obrażenia
+        // Spowolnienie
+        // ...
     }
 
     // 3. ŚMIERĆ
@@ -4684,4 +4951,256 @@ void InitClouds() {
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
     glEnableVertexAttribArray(1);
+}
+// Funkcja działająca w tle
+void ChunkWorkerThread() {
+    while (g_isRunning) {
+        glm::ivec2 coords;
+
+        // 1. Czy jest coś do zrobienia?
+        if (g_chunksToLoad.try_pop(coords)) {
+
+            // 2. Wykonaj CIĘŻKĄ PRACĘ (Konstruktor Chunk liczy cały teren)
+            // Uwaga: Używamy globalnych g_selectedWorldName i g_selectedWorldSeed
+            Chunk* newChunk = new Chunk(
+                glm::vec3(coords.x * CHUNK_WIDTH, 0.0f, coords.y * CHUNK_DEPTH),
+                g_selectedWorldName,
+                g_selectedWorldSeed
+            );
+
+            // 3. Wyślij gotowy obiekt do głównego wątku
+            g_chunksReady.push(newChunk);
+        }
+        else {
+            // Jeśli nie ma pracy, śpij chwilę, żeby nie grzać procesora
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+}
+void UnloadFarChunks() {
+    // 1. Oblicz pozycję gracza w koordynatach chunków
+    int pCX = static_cast<int>(floor(camera.Position.x / CHUNK_WIDTH));
+    int pCZ = static_cast<int>(floor(camera.Position.z / CHUNK_DEPTH));
+
+    // Margines bezpieczeństwa (np. 2 chunki dalej niż mgła)
+    // Żeby nie usuwać chunków, które są na granicy widoczności (bo będą migać)
+    int unloadDist = RENDER_DISTANCE + 3;
+
+    // Lista współrzędnych do usunięcia (żeby nie psuć iteratora mapy podczas pętli)
+    std::vector<glm::ivec2> toRemove;
+
+    // 2. Przeglądamy wszystkie aktywne chunki
+    for (auto const& [pos, chunkPtr] : g_WorldChunks) {
+        // Oblicz dystans w osiach (Manhattan distance jest szybszy i pasuje do kwadratowej mapy)
+        int distX = abs(pos.x - pCX);
+        int distZ = abs(pos.y - pCZ); // W mapie użyliśmy .y jako Z
+
+        // Jeśli chunk jest za daleko
+        if (distX > unloadDist || distZ > unloadDist) {
+            toRemove.push_back(pos);
+        }
+    }
+
+    // 3. Usuwamy znalezione chunki
+    for (auto pos : toRemove) {
+        Chunk* chunkPtr = g_WorldChunks[pos];
+
+        // A. ZAPISZ NA DYSK! (Kluczowe, żeby nie stracić zmian)
+        chunkPtr->SaveToFile();
+
+        // B. Usuń z listy 'chunk_storage' (to wywoła destruktor i zwolni VBO/VAO)
+        // Musimy użyć remove_if, żeby znaleźć ten konkretny obiekt w liście
+        chunk_storage.remove_if([chunkPtr](const Chunk& c){
+            return &c == chunkPtr; // Porównaj adresy pamięci
+        });
+
+        // C. Usuń wskaźnik z mapy
+        g_WorldChunks.erase(pos);
+    }
+
+    // Opcjonalne info (tylko jeśli coś usunięto)
+    if (!toRemove.empty()) {
+        // std::cout << "Usunieto " << toRemove.size() << " starych chunkow." << std::endl;
+    }
+}
+void DrawZombie(Shader& shader, const Entity& e, unsigned int vao) {
+    // Tekstura: Zielona (jak trawa)
+    // Możesz też dodać nową teksturę UV_ZOMBIE do Chunk.h, jeśli narysujesz go w atlasie
+    glm::vec2 uvOff = glm::vec2(UV_GRASS_TOP[0], UV_GRASS_TOP[1]);
+
+    shader.setVec2("u_uvOffset", uvOff);
+    shader.setVec2("u_uvOffsetTop", uvOff);
+    shader.setVec2("u_uvOffsetBottom", uvOff);
+    shader.setInt("u_multiTexture", 0);
+
+    // Animacja chodzenia
+    float limbAngle = 0.0f;
+    if (e.isWalking) limbAngle = sin(glfwGetTime() * 10.0f) * 45.0f;
+
+    // Animacja ataku (ręce w górze)
+    float armsBaseAngle = 90.0f; // Zombie trzyma ręce przed sobą
+
+    glm::mat4 baseModel = glm::mat4(1.0f);
+    baseModel = glm::translate(baseModel, e.position);
+    // Obrót: Zwróć uwagę, że dla humanoida rotationY musi być dopasowane
+    baseModel = glm::rotate(baseModel, glm::radians(-e.rotationY), glm::vec3(0, 1, 0));
+
+    // 1. TUŁÓW (Pionowy)
+    {
+        glm::mat4 model = baseModel;
+        model = glm::translate(model, glm::vec3(0.0f, 1.0f, 0.0f)); // Środek na wys 1.0
+        model = glm::scale(model, glm::vec3(0.5f, 0.9f, 0.25f));    // Chudy i wysoki
+        shader.setMat4("model", model);
+        glBindVertexArray(vao);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+    }
+
+    // 2. GŁOWA
+    {
+        glm::mat4 model = baseModel;
+        model = glm::translate(model, glm::vec3(0.0f, 1.7f, 0.0f));
+        model = glm::scale(model, glm::vec3(0.5f, 0.5f, 0.5f));
+        shader.setMat4("model", model);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+    }
+
+    // 3. NOGI (x2)
+    glm::vec3 legPos[] = { glm::vec3(-0.15f, 0.55f, 0.0f), glm::vec3(0.15f, 0.55f, 0.0f) };
+    for (int i = 0; i < 2; i++) {
+        glm::mat4 model = baseModel;
+        model = glm::translate(model, legPos[i]);
+
+        float angle = (i == 0) ? limbAngle : -limbAngle;
+        model = glm::rotate(model, glm::radians(angle), glm::vec3(1, 0, 0));
+        model = glm::translate(model, glm::vec3(0, -0.3f, 0)); // Przesuń środek nogi w dół
+
+        model = glm::scale(model, glm::vec3(0.22f, 0.8f, 0.22f));
+        shader.setMat4("model", model);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+    }
+
+    // 4. RĘCE (x2) - Wyciągnięte przed siebie
+    glm::vec3 armPos[] = { glm::vec3(-0.35f, 1.3f, 0.0f), glm::vec3(0.35f, 1.3f, 0.0f) };
+    for (int i = 0; i < 2; i++) {
+        glm::mat4 model = baseModel;
+        model = glm::translate(model, armPos[i]);
+
+        // Machanie rękami (mniej niż nogami) + bazowe uniesienie
+        float angle = (i == 0) ? -limbAngle * 0.5f : limbAngle * 0.5f;
+        model = glm::rotate(model, glm::radians(-armsBaseAngle + angle), glm::vec3(1, 0, 0));
+        model = glm::translate(model, glm::vec3(0, -0.3f, 0));
+
+        model = glm::scale(model, glm::vec3(0.2f, 0.8f, 0.2f));
+        shader.setMat4("model", model);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+    }
+}
+void InitBloom() {
+    // 1. Sprawdź wymiary
+    std::cout << "DEBUG: InitBloom Start. Wymiary: " << SCR_WIDTH << "x" << SCR_HEIGHT << std::endl;
+
+    if (SCR_WIDTH == 0 || SCR_HEIGHT == 0) {
+        std::cout << "BLAD KRYTYCZNY: Probujemy utworzyc bufor o rozmiarze 0! Przerywam." << std::endl;
+        return;
+    }
+
+    // 2. Czyszczenie starych (bez zmian)
+    if (hdrFBO != 0) {
+        glDeleteFramebuffers(1, &hdrFBO);
+        glDeleteTextures(2, colorBuffers);
+        glDeleteRenderbuffers(1, &rboDepth);
+        glDeleteFramebuffers(2, pingpongFBO);
+        glDeleteTextures(2, pingpongColorbuffers);
+    }
+
+    // 3. Tworzenie Głównego FBO
+    glGenFramebuffers(1, &hdrFBO);
+    glBindFramebuffer(GL_FRAMEBUFFER, hdrFBO);
+
+    glGenTextures(2, colorBuffers);
+    for (unsigned int i = 0; i < 2; i++) {
+        glBindTexture(GL_TEXTURE_2D, colorBuffers[i]);
+
+        // Próba utworzenia tekstury HDR (RGBA16F)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, SCR_WIDTH, SCR_HEIGHT, 0, GL_RGBA, GL_FLOAT, NULL);
+
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE_2D, colorBuffers[i], 0);
+    }
+
+    unsigned int attachments[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+    glDrawBuffers(2, attachments);
+
+    // Renderbuffer (Głębia)
+    glGenRenderbuffers(1, &rboDepth);
+    glBindRenderbuffer(GL_RENDERBUFFER, rboDepth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT, SCR_WIDTH, SCR_HEIGHT);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rboDepth);
+
+    // --- DIAGNOSTYKA BŁĘDU ---
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        std::cout << "BLAD KRYTYCZNY: HDR Framebuffer niekompletny! Kod: " << status << std::endl;
+        if (status == GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT) std::cout << "Przyczyna: Problem z zalacznikiem (Tekstura/RBO)." << std::endl;
+        if (status == GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT) std::cout << "Przyczyna: Brak zalacznikow." << std::endl;
+        if (status == GL_FRAMEBUFFER_UNSUPPORTED) std::cout << "Przyczyna: Format GL_RGBA16F nieobslugiwany przez karte!" << std::endl;
+    } else {
+        std::cout << "SUKCES: HDR Framebuffer utworzony poprawnie." << std::endl;
+    }
+    // -------------------------
+
+    // 4. Ping-Pong FBO (Blur)
+    glGenFramebuffers(2, pingpongFBO);
+    glGenTextures(2, pingpongColorbuffers);
+    for (unsigned int i = 0; i < 2; i++) {
+        glBindFramebuffer(GL_FRAMEBUFFER, pingpongFBO[i]);
+        glBindTexture(GL_TEXTURE_2D, pingpongColorbuffers[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, SCR_WIDTH, SCR_HEIGHT, 0, GL_RGBA, GL_FLOAT, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, pingpongColorbuffers[i], 0);
+
+        // Sprawdzenie PingPong FBO
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+            std::cout << "BLAD: PingPong FBO [" << i << "] niekompletny!" << std::endl;
+    }
+
+    // 5. Quad (tylko raz)
+    if (quadVAO == 0) {
+        float quadVertices[] = {
+            -1.0f,  1.0f,  0.0f, 1.0f,
+            -1.0f, -1.0f,  0.0f, 0.0f,
+             1.0f, -1.0f,  1.0f, 0.0f,
+            -1.0f,  1.0f,  0.0f, 1.0f,
+             1.0f, -1.0f,  1.0f, 0.0f,
+             1.0f,  1.0f,  1.0f, 1.0f
+        };
+        glGenVertexArrays(1, &quadVAO);
+        glGenBuffers(1, &quadVBO);
+        glBindVertexArray(quadVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, quadVBO);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+        glBindVertexArray(0);
+    }
+
+    // Powrót do domyślnego bufora
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+// Funkcja rysująca Quad
+void RenderQuad() {
+    if (quadVAO == 0) InitBloom(); // Zabezpieczenie
+    glBindVertexArray(quadVAO);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindVertexArray(0);
 }

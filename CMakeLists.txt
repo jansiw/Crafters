@@ -107,6 +107,10 @@ set(ASSET_FILES
         ${PROJECT_SOURCE_DIR}/pop.mp3
         ${PROJECT_SOURCE_DIR}/clouds.frag
         ${PROJECT_SOURCE_DIR}/clouds.vert
+        ${PROJECT_SOURCE_DIR}/blur.frag
+        ${PROJECT_SOURCE_DIR}/blur.vert
+        ${PROJECT_SOURCE_DIR}/final.frag
+        ${PROJECT_SOURCE_DIR}/final.vert
 )
 
 # Kopiuj te pliki do folderu docelowego (gdzie jest .exe)
