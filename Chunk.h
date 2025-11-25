@@ -47,6 +47,7 @@ const int SEA_LEVEL = 32;
 #define BLOCK_ID_LAVA_3  23
 #define BLOCK_ID_LAVA_2  24
 #define BLOCK_ID_LAVA_1  25
+#define BLOCK_ID_FURNACE 26
 
 // --- Definicje Atlasu (bez zmian) ---
 const float ATLAS_COLS = 8.0f;
@@ -74,6 +75,9 @@ const float UV_IRON_ORE[2]    = { 5.0f * UV_STEP_U, 1.0f * UV_STEP_V };
 const float UV_GOLD_ORE[2]    = { 5.0f * UV_STEP_U, 0.0f * UV_STEP_V };
 const float UV_DIAMOND_ORE[2] = { 6.0f * UV_STEP_U, 2.0f * UV_STEP_V };
 const float UV_LAVA[2] = { 6.0f * UV_STEP_U, 1.0f * UV_STEP_V }; // Dostosuj do swojego atlasu!
+const float UV_FURNACE_SIDE[2]  = { 7.0f * UV_STEP_U, 2.0f * UV_STEP_V };
+const float UV_FURNACE_FRONT[2] = { 6.0f * UV_STEP_U, 0.0f * UV_STEP_V };
+const float UV_FURNACE_TOP[2]   = { 7.0f * UV_STEP_U, 1.0f * UV_STEP_V };
 
 // --- Dane Geometrii (bez zmian) ---
 const float baseFaces[][18] = {
@@ -1093,6 +1097,19 @@ public:
         else if (blockID == BLOCK_ID_IRON_ORE)    uvBase = UV_IRON_ORE;
         else if (blockID == BLOCK_ID_GOLD_ORE)    uvBase = UV_GOLD_ORE;
         else if (blockID == BLOCK_ID_DIAMOND_ORE) uvBase = UV_DIAMOND_ORE;
+        else if (blockID == BLOCK_ID_FURNACE) {
+            // FaceIndex: 0=Góra, 1=Dół, 2=Przód(+Z), 3=Tył, 4=Prawo, 5=Lewo
+
+            if (faceIndex == 0 || faceIndex == 1) {
+                uvBase = UV_FURNACE_TOP;
+            }
+            else if (faceIndex == 2) {
+                uvBase = UV_FURNACE_FRONT; // Zakładamy, że piec zawsze patrzy w stronę +Z
+            }
+            else {
+                uvBase = UV_FURNACE_SIDE;
+            }
+        }
         else if (isAnyLava(blockID)) uvBase = UV_LAVA;
         else return;
         // -----------------------------------------------------------
